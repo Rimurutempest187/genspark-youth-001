@@ -1027,9 +1027,10 @@ async def cmd_restore_receive(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try:
         tg_file = await ctx.bot.get_file(update.message.document.file_id)
         await tg_file.download_to_drive(DB_PATH)
-        await update.message.reply_text("✅ Database Restore ပြီးပါပြီ!")
+        await update.message.reply_text(f"✅ Database ကို အောင်မြင်စွာ ပြန်လည်သိမ်းဆည်းပြီးပါပြီ!\n📅 {_now()}")
     except Exception as e:
         await update.message.reply_text(f"❌ Restore မအောင်မြင်ပါ: {e}")
+        return RESTORE_FILE
     return ConversationHandler.END
 
 
