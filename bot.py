@@ -15,7 +15,7 @@ import shutil
 import sqlite3
 from datetime import datetime
 from functools import wraps
-
+from typing import Optional
 from dotenv import load_dotenv
 from telegram import (
     InlineKeyboardButton,
@@ -207,7 +207,7 @@ def is_admin(user_id: int) -> bool:
     return row is not None
 
 
-def get_setting(key: str) -> str | None:
+def get_setting(key: str) -> Optional[str]:
     with _db() as conn:
         row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
     return row[0] if row else None
@@ -809,12 +809,15 @@ async def cmd_edbirthday_save(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parts = [p.strip() for p in line.split("|")]
             if len(parts) < 2:
                 continue
+
             dp = parts[1].split("/")
             if len(dp) < 2:
                 continue
+
             try:
                 month, day = int(dp[0]), int(dp[1])
                 year = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else None
+
                 conn.execute(
                     """INSERT INTO birthdays
                        (name, birth_month, birth_day, birth_year, created_at)
@@ -822,9 +825,11 @@ async def cmd_edbirthday_save(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     (parts[0], month, day, year, _now()),
                 )
                 count += 1
-            except ValueError:
-                pass
+            except Exception:
+                continue
+
         conn.commit()
+
     await update.message.reply_text(f"✅ Birthday {count} ခု ထည့်သွင်းပြီးပါပြီ!")
     return ConversationHandler.END
 
