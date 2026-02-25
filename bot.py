@@ -1230,7 +1230,6 @@ async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         text = "📅 *Events*\n\n" + "\n".join(f"🗓 {t} — {d}" for t, d in rows) if rows else "📅 Events မရှိသေးပါ"
         await q.edit_message_text(text, parse_mode=ParseMode.MARKDOWN)
 
-       # ── Quiz answer ──
     elif data.startswith("quiz_"):
         parts = data.split("_")               # quiz_<qid>_<key>
         if len(parts) < 3:
@@ -1250,7 +1249,6 @@ async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             correct = row[0]
 
             if sel.upper() == correct.upper():
-                # Robust upsert (works even if SQLite ON CONFLICT syntax not available)
                 exists = conn.execute(
                     "SELECT 1 FROM quiz_scores WHERE user_id=?", (user.id,)
                 ).fetchone()
@@ -1265,11 +1263,12 @@ async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                         (user.id, user.username or "", user.first_name or ""),
                     )
                 conn.commit()
-                resp = f"✅ *မှန်သည်!* 🎉\n*{user.first_name}* +1 pt ရရှိသည်!"
+                # use HTML formatting and escape dynamic values
+                uname_html = escape(user.first_name or user.username or "User")
+                resp = f"✅ <b>မှန်သည်!</b> 🎉\n<b>{uname_html}</b> +1 pt ရရှိပါသည်!"
             else:
-                resp = f"❌ *မှားသည်!*\nမှန်သောအဖြေ: *{correct}*"
-        await q.edit_message_text(resp, parse_mode=ParseMode.MARKDOWN)
-
+                resp = f"❌ <b>မှားသည်!</b>\nမှန်သောအဖြေ: <code>{escape(correct)}</code>"
+        await q.edit_message_text(resp, parse_mode=ParseMode.HTML)
     # ── Vote ──
     elif data.startswith("voteresult_"):
         vid = int(data.split("_")[1])
