@@ -1,19 +1,9 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-╔══════════════════════════════════════════════════════════╗
-║         Church Community Telegram Bot                    ║
-║         Ready-to-Run Full Implementation                 ║
-║         python-telegram-bot v20+  |  SQLite DB          ║
-╚══════════════════════════════════════════════════════════╝
-"""
-
 import json
 import logging
 import os
 import shutil
 import sqlite3
-from datetime import datetime, time
+from datetime import datetime
 from functools import wraps
 from typing import Optional
 from dotenv import load_dotenv
@@ -196,17 +186,7 @@ def _db():
 
 def _now() -> str:
     return datetime.now().isoformat(sep=" ", timespec="seconds")
-BACKUP_DIR = "backups"
 
-def backup_db() -> str:
-    os.makedirs(BACKUP_DIR, exist_ok=True)
-
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    backup_file = os.path.join(BACKUP_DIR, f"church_backup_{ts}.db")
-
-    shutil.copy2(DB_PATH, backup_file)
-    logger.info("Backup created → %s", backup_file)
-    return backup_file
 
 # ═══════════════════════════ HELPERS ══════════════════════════
 def is_admin(user_id: int) -> bool:
@@ -290,22 +270,7 @@ def admin_only(func):
         return await func(update, ctx, *a, **kw)
     return wrapper
 
-async def auto_backup_job(ctx: ContextTypes.DEFAULT_TYPE):
-    try:
-        file_path = backup_db()
 
-        # super admin ကို file ပို့မယ်
-        if SUPER_ADMIN_ID:
-            with open(file_path, "rb") as f:
-                await ctx.bot.send_document(
-                    SUPER_ADMIN_ID,
-                    document=f,
-                    filename=os.path.basename(file_path),
-                    caption="🗄️ Auto Database Backup",
-                )
-
-    except Exception as e:
-        logger.error("Auto backup failed: %s", e)
 # ═══════════════════════ USER COMMANDS ════════════════════════
 
 # ─── /start ───
@@ -363,7 +328,7 @@ async def cmd_helps(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/all \\- Members Mention\n"
         "/vote \\- မဲပေး\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        "User Commands "
+        "⚙️ Admin Commands → /edit"
     )
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN_V2)
 
@@ -1380,15 +1345,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if cnt >= interval:
             await _send_quiz(chat.id, ctx)
 
-@admin_only
-async def cmd_backup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    file_path = backup_db()
-    with open(file_path, "rb") as f:
-        await update.message.reply_document(
-            document=f,
-            filename=os.path.basename(file_path),
-            caption="🗄️ Manual Backup Completed",
-        )
+
 # ═══════════════════════════ MAIN ═════════════════════════════
 def main() -> None:
     if not BOT_TOKEN:
@@ -1396,12 +1353,6 @@ def main() -> None:
 
     init_db()
     app = Application.builder().token(BOT_TOKEN).build()
-    app.job_queue.run_daily(
-    auto_backup_job,
-    time=time(hour=0, minute=0, second=0),
-)
-
-
 
     # ── Conversation Handlers ──
     def conv(entry_cmd, entry_fn, state_id, state_fn, extra_filter=None):
@@ -1470,7 +1421,6 @@ def main() -> None:
     for cmd, fn in user_cmds:
         app.add_handler(CommandHandler(cmd, fn))
     app.add_handler(CommandHandler(["Tops", "tops"], cmd_tops))
-    app.add_handler(CommandHandler("backup", cmd_backup))
 
     # ── Admin commands ──
     admin_cmds = [
@@ -1490,10 +1440,9 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, on_message))
 
-
     logger.info("✝️  Church Community Bot is running …")
     app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
-    main()
+    main() 
