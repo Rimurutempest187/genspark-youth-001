@@ -6,6 +6,7 @@ import sqlite3
 from datetime import datetime
 from functools import wraps
 from typing import Optional
+from html import escape
 from dotenv import load_dotenv
 from telegram import (
     InlineKeyboardButton,
