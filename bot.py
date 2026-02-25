@@ -516,17 +516,31 @@ async def _send_quiz(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_tops(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     with _db() as conn:
         rows = conn.execute(
-            "SELECT username, first_name, score FROM quiz_scores ORDER BY score DESC LIMIT 10"
+            "SELECT user_id, username, first_name, score FROM quiz_scores ORDER BY score DESC, user_id ASC LIMIT 10"
         ).fetchall()
-    if rows:
-        medals = ["🥇", "🥈", "🥉"]
-        text = "🏆 *Quiz Ranking*\n━━━━━━━━━━━━━━━━\n"
-        for i, (uname, fname, score) in enumerate(rows, 1):
-            medal = medals[i - 1] if i <= 3 else f"*{i}.*"
-            display = f"@{uname}" if uname else fname
-            text += f"{medal} {display} — *{score}* pts\n"
-    else:
-        text = "🏆 Ranking မရှိသေးပါ\n`/quiz` ဖြင့် ဖြေဆိုနိုင်သည်"
+    if not rows:
+        await update.message.reply_text(
+            "🏆 Ranking မရှိသေးပါ\n`/quiz` ဖြင့် ဖြေဆိုပြီး စတင်ပါ။",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    medals = ["🥇", "🥈", "🥉"]
+    lines = ["🏆 *Quiz Ranking*\n━━━━━━━━━━━━━━━━\n"]
+    for i, (uid, uname, fname, score) in enumerate(rows, 1):
+        if i <= 3:
+            medal = medals[i - 1]
+        else:
+            medal = f"{i}."
+        if uname:
+            display = f"@{uname}"
+        elif fname:
+            display = f"[{fname}](tg://user?id={uid})"
+        else:
+            display = f"`User {uid}`"
+        lines.append(f"{medal} {display} — *{score}* pts")
+
+    text = "\n".join(lines)
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
 
