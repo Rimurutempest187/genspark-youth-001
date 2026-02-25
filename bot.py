@@ -1215,12 +1215,15 @@ async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         text = "📅 *Events*\n\n" + "\n".join(f"🗓 {t} — {d}" for t, d in rows) if rows else "📅 Events မရှိသေးပါ"
         await q.edit_message_text(text, parse_mode=ParseMode.MARKDOWN)
 
-    # ── Quiz answer ──
+       # ── Quiz answer ──
     elif data.startswith("quiz_"):
         parts = data.split("_")               # quiz_<qid>_<key>
         if len(parts) < 3:
             return
-        qid, sel = int(parts[1]), parts[2]
+        try:
+            qid, sel = int(parts[1]), parts[2]
+        except ValueError:
+            return
         user = q.from_user
         with _db() as conn:
             row = conn.execute(
@@ -1230,13 +1233,22 @@ async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 await q.edit_message_text("❌ မေးခွန်း မတွေ့ပါ")
                 return
             correct = row[0]
+
             if sel.upper() == correct.upper():
-                conn.execute(
-                    """INSERT INTO quiz_scores (user_id, username, first_name, score)
-                       VALUES (?,?,?,1)
-                       ON CONFLICT(user_id) DO UPDATE SET score=score+1""",
-                    (user.id, user.username or "", user.first_name or ""),
-                )
+                # Robust upsert (works even if SQLite ON CONFLICT syntax not available)
+                exists = conn.execute(
+                    "SELECT 1 FROM quiz_scores WHERE user_id=?", (user.id,)
+                ).fetchone()
+                if exists:
+                    conn.execute(
+                        "UPDATE quiz_scores SET score = score + 1, username = ?, first_name = ? WHERE user_id = ?",
+                        (user.username or "", user.first_name or "", user.id),
+                    )
+                else:
+                    conn.execute(
+                        "INSERT INTO quiz_scores (user_id, username, first_name, score) VALUES (?,?,?,1)",
+                        (user.id, user.username or "", user.first_name or ""),
+                    )
                 conn.commit()
                 resp = f"✅ *မှန်သည်!* 🎉\n*{user.first_name}* +1 pt ရရှိသည်!"
             else:
