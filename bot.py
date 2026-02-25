@@ -521,28 +521,30 @@ async def cmd_tops(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ).fetchall()
     if not rows:
         await update.message.reply_text(
-            "🏆 Ranking မရှိသေးပါ\n`/quiz` ဖြင့် ဖြေဆိုပြီး စတင်ပါ။",
-            parse_mode=ParseMode.MARKDOWN,
+            "🏆 Ranking မရှိသေးပါ\n/quiz ဖြင့် ဖြေဆိုပြီး စတင်ပါ။",
+            parse_mode=ParseMode.HTML,
         )
         return
 
     medals = ["🥇", "🥈", "🥉"]
-    lines = ["🏆 *Quiz Ranking*\n━━━━━━━━━━━━━━━━\n"]
+    lines = ["🏆 <b>Quiz Ranking</b>\n━━━━━━━━━━━━━━━━\n"]
     for i, (uid, uname, fname, score) in enumerate(rows, 1):
         if i <= 3:
             medal = medals[i - 1]
         else:
             medal = f"{i}."
         if uname:
-            display = f"@{uname}"
+            # display plain @username (no need to escape @), but escape username text
+            display = "@" + escape(uname)
         elif fname:
-            display = f"[{fname}](tg://user?id={uid})"
+            # mention by user id using tg://user?id=
+            display = f'<a href="tg://user?id={uid}">{escape(fname)}</a>'
         else:
             display = f"`User {uid}`"
-        lines.append(f"{medal} {display} — *{score}* pts")
+        lines.append(f"{medal} {display} — <b>{score}</b> pts")
 
     text = "\n".join(lines)
-    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
 
 # ─── /report (ConversationHandler) ───
