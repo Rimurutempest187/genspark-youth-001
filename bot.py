@@ -363,7 +363,7 @@ async def cmd_helps(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/all \\- Members Mention\n"
         "/vote \\- မဲပေး\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        "⚙️ Admin Commands → /edit"
+        "User Commands "
     )
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN_V2)
 
