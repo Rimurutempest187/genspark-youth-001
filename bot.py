@@ -1,1768 +1,1772 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 import os
-import re
 import json
+import html
 import shutil
 import sqlite3
 import logging
+import datetime as dt
 from dataclasses import dataclass
-from datetime import datetime, date
-from zoneinfo import ZoneInfo
-from typing import Optional
+from typing import Optional, Dict, Any, List, Tuple
 
 from dotenv import load_dotenv
+
 from telegram import (
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    InputFile,
 )
 from telegram.constants import ParseMode, ChatType
 from telegram.ext import (
-    ApplicationBuilder,
-    ContextTypes,
+    Application,
     CommandHandler,
     MessageHandler,
     CallbackQueryHandler,
+    ContextTypes,
     filters,
-    ConversationHandler,
+    Defaults,
 )
 
-# =========================
-# Config / Logging
-# =========================
-load_dotenv()
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-DB_PATH = os.getenv("DB_PATH", "church_bot.db").strip()
-TZ_NAME = os.getenv("TZ", "Asia/Yangon").strip()
-
-ADMIN_IDS_ENV = os.getenv("ADMIN_IDS", "").strip()
-ENV_ADMIN_IDS = set()
-if ADMIN_IDS_ENV:
-    for x in ADMIN_IDS_ENV.split(","):
-        x = x.strip()
-        if x.isdigit():
-            ENV_ADMIN_IDS.add(int(x))
-
+# ---------------------------
+# Logging
+# ---------------------------
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     level=logging.INFO,
 )
-log = logging.getLogger("church-community-bot")
+logger = logging.getLogger("ChurchCommunityBot")
 
+# ---------------------------
+# ENV
+# ---------------------------
+load_dotenv()
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+ADMIN_IDS_ENV = os.getenv("ADMIN_IDS", "").strip()
 
-def now_tz() -> datetime:
-    return datetime.now(ZoneInfo(TZ_NAME))
+if not BOT_TOKEN:
+    raise SystemExit("BOT_TOKEN မရှိပါ။ .env ထဲမှာ BOT_TOKEN ထည့်ပေးပါ။")
 
+def _parse_admin_ids(raw: str) -> List[int]:
+    ids: List[int] = []
+    if not raw:
+        return ids
+    for x in raw.split(","):
+        x = x.strip()
+        if x.isdigit():
+            ids.append(int(x))
+    return ids
 
-def today_tz() -> date:
-    return now_tz().date()
+BOOTSTRAP_ADMIN_IDS: List[int] = _parse_admin_ids(ADMIN_IDS_ENV)
 
+# ---------------------------
+# DB
+# ---------------------------
+DB_FILE = os.getenv("DB_FILE", "church_community.db")
 
-# =========================
-# SQLite Database Helper
-# =========================
+def utc_now_iso() -> str:
+    return dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+
+def today_ymd() -> dt.date:
+    return dt.date.today()
+
+def safe_full_name(first: Optional[str], last: Optional[str]) -> str:
+    f = (first or "").strip()
+    l = (last or "").strip()
+    name = (f + " " + l).strip()
+    return name if name else "Unknown"
+
+def mention_html(user_id: int, name: str) -> str:
+    # Telegram HTML mention
+    return f'<a href="tg://user?id={user_id}">{html.escape(name)}</a>'
+
 class DB:
     def __init__(self, path: str):
         self.path = path
-        self._init_db()
-
-    def conn(self):
-        c = sqlite3.connect(self.path)
-        c.row_factory = sqlite3.Row
-        return c
-
-    def _init_db(self):
-        with self.conn() as con:
-            cur = con.cursor()
-            cur.execute("PRAGMA journal_mode=WAL;")
-            cur.execute("PRAGMA foreign_keys=ON;")
-
-            # Global single-row tables
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS about (
-                    id INTEGER PRIMARY KEY CHECK (id=1),
-                    text TEXT NOT NULL
-                );
-            """)
-            cur.execute("""
-                INSERT OR IGNORE INTO about (id, text) VALUES (1, 'မင်္ဂလာပါ။ /about ကိုပြင်ရန် Admin မှ /edabout သုံးပါ။');
-            """)
-
-            # Contacts
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS contacts (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    name TEXT NOT NULL,
-                    phone TEXT NOT NULL
-                );
-            """)
-
-            # Verses: type morning/night
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS verses (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    vtype TEXT NOT NULL CHECK (vtype IN ('morning','night')),
-                    text TEXT NOT NULL,
-                    created_at TEXT NOT NULL
-                );
-            """)
-
-            # Events
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS events (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    event_date TEXT,
-                    text TEXT NOT NULL,
-                    created_at TEXT NOT NULL
-                );
-            """)
-
-            # Birthdays (month/day)
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS birthdays (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    name TEXT NOT NULL,
-                    month INTEGER NOT NULL CHECK (month BETWEEN 1 AND 12),
-                    day INTEGER NOT NULL CHECK (day BETWEEN 1 AND 31)
-                );
-            """)
-
-            # Prayer requests
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS pray_requests (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    chat_id INTEGER NOT NULL,
-                    user_id INTEGER NOT NULL,
-                    name TEXT NOT NULL,
-                    username TEXT,
-                    text TEXT NOT NULL,
-                    created_at TEXT NOT NULL
-                );
-            """)
-
-            # Quiz questions
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS quiz_questions (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    question TEXT NOT NULL,
-                    a TEXT NOT NULL,
-                    b TEXT NOT NULL,
-                    c TEXT NOT NULL,
-                    d TEXT NOT NULL,
-                    correct TEXT NOT NULL CHECK (correct IN ('A','B','C','D')),
-                    created_at TEXT NOT NULL
-                );
-            """)
-
-            # Quiz scores
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS quiz_scores (
-                    user_id INTEGER PRIMARY KEY,
-                    name TEXT NOT NULL,
-                    username TEXT,
-                    score INTEGER NOT NULL DEFAULT 0,
-                    updated_at TEXT NOT NULL
-                );
-            """)
-
-            # Chat settings (per chat)
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS chat_settings (
-                    chat_id INTEGER PRIMARY KEY,
-                    auto_quiz_every INTEGER NOT NULL DEFAULT 0,
-                    msg_count INTEGER NOT NULL DEFAULT 0
-                );
-            """)
-
-            # Track groups/chats
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS chats (
-                    chat_id INTEGER PRIMARY KEY,
-                    title TEXT,
-                    chat_type TEXT NOT NULL,
-                    last_seen TEXT NOT NULL
-                );
-            """)
-
-            # Track users in chats (for /all mentions)
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS chat_users (
-                    chat_id INTEGER NOT NULL,
-                    user_id INTEGER NOT NULL,
-                    username TEXT,
-                    first_name TEXT,
-                    last_name TEXT,
-                    last_seen TEXT NOT NULL,
-                    PRIMARY KEY (chat_id, user_id)
-                );
-            """)
-
-            # Admins (DB-managed; ENV admins are also admins)
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS admins (
-                    user_id INTEGER PRIMARY KEY,
-                    enabled INTEGER NOT NULL DEFAULT 1,
-                    updated_at TEXT NOT NULL
-                );
-            """)
-
-            # Vote config + votes
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS vote_configs (
-                    chat_id INTEGER PRIMARY KEY,
-                    vote_id TEXT NOT NULL,
-                    question TEXT NOT NULL,
-                    options_json TEXT NOT NULL,
-                    active INTEGER NOT NULL DEFAULT 1,
-                    created_at TEXT NOT NULL
-                );
-            """)
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS vote_votes (
-                    vote_id TEXT NOT NULL,
-                    user_id INTEGER NOT NULL,
-                    choice_index INTEGER NOT NULL,
-                    voted_at TEXT NOT NULL,
-                    PRIMARY KEY (vote_id, user_id)
-                );
-            """)
-
-            con.commit()
-
-    # -------- Admin --------
-    def is_admin(self, user_id: int) -> bool:
-        if user_id in ENV_ADMIN_IDS:
-            return True
-        with self.conn() as con:
-            row = con.execute(
-                "SELECT enabled FROM admins WHERE user_id=?",
-                (user_id,),
-            ).fetchone()
-            return bool(row and row["enabled"] == 1)
-
-    def toggle_admin(self, user_id: int) -> str:
-        ts = now_tz().isoformat()
-        with self.conn() as con:
-            row = con.execute("SELECT enabled FROM admins WHERE user_id=?", (user_id,)).fetchone()
-            if row is None:
-                con.execute(
-                    "INSERT INTO admins (user_id, enabled, updated_at) VALUES (?,?,?)",
-                    (user_id, 1, ts),
-                )
-                con.commit()
-                return "✅ Admin အဖြစ် ထည့်ပြီးပါပြီ။"
-            enabled = row["enabled"]
-            new_enabled = 0 if enabled == 1 else 1
-            con.execute("UPDATE admins SET enabled=?, updated_at=? WHERE user_id=?", (new_enabled, ts, user_id))
-            con.commit()
-            return "✅ Admin ပြောင်းလဲပြီးပါပြီ (toggle)။"
-
-    # -------- Tracking --------
-    def upsert_chat(self, chat_id: int, title: str | None, chat_type: str):
-        ts = now_tz().isoformat()
-        with self.conn() as con:
-            con.execute("""
-                INSERT INTO chats (chat_id, title, chat_type, last_seen)
-                VALUES (?,?,?,?)
-                ON CONFLICT(chat_id) DO UPDATE SET
-                    title=excluded.title,
-                    chat_type=excluded.chat_type,
-                    last_seen=excluded.last_seen
-            """, (chat_id, title, chat_type, ts))
-            con.commit()
-
-def upsert_chat(self, chat_id: int, title: Optional[str], chat_type: str):
-        ts = now_tz().isoformat()
-        with self.conn() as con:
-            con.execute("""
-                INSERT INTO chat_users (chat_id, user_id, username, first_name, last_name, last_seen)
-                VALUES (?,?,?,?,?,?)
-                ON CONFLICT(chat_id, user_id) DO UPDATE SET
-                    username=excluded.username,
-                    first_name=excluded.first_name,
-                    last_name=excluded.last_name,
-                    last_seen=excluded.last_seen
-            """, (chat_id, user_id, username, first_name, last_name, ts))
-            con.commit()
-
-    # -------- Settings --------
-    def get_settings(self, chat_id: int):
-        with self.conn() as con:
-            row = con.execute("SELECT * FROM chat_settings WHERE chat_id=?", (chat_id,)).fetchone()
-            if row is None:
-                con.execute("INSERT INTO chat_settings (chat_id, auto_quiz_every, msg_count) VALUES (?,?,?)", (chat_id, 0, 0))
-                con.commit()
-                row = con.execute("SELECT * FROM chat_settings WHERE chat_id=?", (chat_id,)).fetchone()
-            return dict(row)
-
-    def set_auto_quiz_every(self, chat_id: int, n: int):
-        with self.conn() as con:
-            con.execute("""
-                INSERT INTO chat_settings (chat_id, auto_quiz_every, msg_count)
-                VALUES (?,?,0)
-                ON CONFLICT(chat_id) DO UPDATE SET auto_quiz_every=excluded.auto_quiz_every
-            """, (chat_id, n))
-            con.commit()
-
-    def inc_msg_count(self, chat_id: int) -> int:
-        s = self.get_settings(chat_id)
-        new_count = int(s["msg_count"]) + 1
-        with self.conn() as con:
-            con.execute("UPDATE chat_settings SET msg_count=? WHERE chat_id=?", (new_count, chat_id))
-            con.commit()
-        return new_count
-
-    def reset_msg_count(self, chat_id: int):
-        with self.conn() as con:
-            con.execute("UPDATE chat_settings SET msg_count=0 WHERE chat_id=?", (chat_id,))
-            con.commit()
-
-    # -------- About --------
-    def get_about(self) -> str:
-        with self.conn() as con:
-            row = con.execute("SELECT text FROM about WHERE id=1").fetchone()
-            return row["text"] if row else ""
-
-    def set_about(self, text: str):
-        with self.conn() as con:
-            con.execute("UPDATE about SET text=? WHERE id=1", (text,))
-            con.commit()
-
-    # -------- Contacts --------
-    def set_contacts(self, items: list[tuple[str, str]]):
-        with self.conn() as con:
-            con.execute("DELETE FROM contacts")
-            con.executemany("INSERT INTO contacts (name, phone) VALUES (?,?)", items)
-            con.commit()
-
-    def get_contacts(self) -> list[sqlite3.Row]:
-        with self.conn() as con:
-            return con.execute("SELECT name, phone FROM contacts ORDER BY id ASC").fetchall()
-
-    # -------- Verses --------
-    def add_verses(self, vtype: str, texts: list[str]):
-        ts = now_tz().isoformat()
-        with self.conn() as con:
-            con.executemany(
-                "INSERT INTO verses (vtype, text, created_at) VALUES (?,?,?)",
-                [(vtype, t, ts) for t in texts],
-            )
-            con.commit()
-
-    def get_verses(self, vtype: str) -> list[str]:
-        with self.conn() as con:
-            rows = con.execute("SELECT text FROM verses WHERE vtype=? ORDER BY id ASC", (vtype,)).fetchall()
-            return [r["text"] for r in rows]
-
-    def delete_last_verses(self, vtype: str, amount: int) -> int:
-        with self.conn() as con:
-            rows = con.execute("SELECT id FROM verses WHERE vtype=? ORDER BY id DESC LIMIT ?", (vtype, amount)).fetchall()
-            ids = [r["id"] for r in rows]
-            if not ids:
-                return 0
-            con.execute(f"DELETE FROM verses WHERE id IN ({','.join('?'*len(ids))})", ids)
-            con.commit()
-            return len(ids)
-
-    # -------- Events --------
-    def set_events(self, items: list[tuple[str | None, str]]):
-        ts = now_tz().isoformat()
-        with self.conn() as con:
-            con.execute("DELETE FROM events")
-            con.executemany(
-                "INSERT INTO events (event_date, text, created_at) VALUES (?,?,?)",
-                [(d, t, ts) for d, t in items],
-            )
-            con.commit()
-
-    def get_events(self) -> list[sqlite3.Row]:
-        with self.conn() as con:
-            return con.execute("SELECT event_date, text FROM events ORDER BY event_date IS NULL, event_date ASC, id ASC").fetchall()
-
-    def delete_last_events(self, amount: int) -> int:
-        with self.conn() as con:
-            rows = con.execute("SELECT id FROM events ORDER BY id DESC LIMIT ?", (amount,)).fetchall()
-            ids = [r["id"] for r in rows]
-            if not ids:
-                return 0
-            con.execute(f"DELETE FROM events WHERE id IN ({','.join('?'*len(ids))})", ids)
-            con.commit()
-            return len(ids)
-
-    # -------- Birthdays --------
-    def set_birthdays(self, items: list[tuple[str, int, int]]):
-        with self.conn() as con:
-            con.execute("DELETE FROM birthdays")
-            con.executemany("INSERT INTO birthdays (name, month, day) VALUES (?,?,?)", items)
-            con.commit()
-
-    def get_birthdays_month(self, month: int) -> list[sqlite3.Row]:
-        with self.conn() as con:
-            return con.execute(
-                "SELECT name, month, day FROM birthdays WHERE month=? ORDER BY day ASC, name ASC",
-                (month,),
-            ).fetchall()
-
-    def delete_last_birthdays(self, amount: int) -> int:
-        with self.conn() as con:
-            rows = con.execute("SELECT id FROM birthdays ORDER BY id DESC LIMIT ?", (amount,)).fetchall()
-            ids = [r["id"] for r in rows]
-            if not ids:
-                return 0
-            con.execute(f"DELETE FROM birthdays WHERE id IN ({','.join('?'*len(ids))})", ids)
-            con.commit()
-            return len(ids)
-
-    # -------- Pray --------
-    def add_pray(self, chat_id: int, user_id: int, name: str, username: str | None, text: str):
-        ts = now_tz().isoformat()
-        with self.conn() as con:
-            con.execute("""
-                INSERT INTO pray_requests (chat_id, user_id, name, username, text, created_at)
-                VALUES (?,?,?,?,?,?)
-            """, (chat_id, user_id, name, username, text, ts))
-            con.commit()
-
-    def get_pray_list(self, limit: int = 50) -> list[sqlite3.Row]:
-        with self.conn() as con:
-            return con.execute("""
-                SELECT name, username, text, created_at
-                FROM pray_requests
-                ORDER BY id DESC
-                LIMIT ?
-            """, (limit,)).fetchall()
-
-    def delete_last_pray(self, amount: int) -> int:
-        with self.conn() as con:
-            rows = con.execute("SELECT id FROM pray_requests ORDER BY id DESC LIMIT ?", (amount,)).fetchall()
-            ids = [r["id"] for r in rows]
-            if not ids:
-                return 0
-            con.execute(f"DELETE FROM pray_requests WHERE id IN ({','.join('?'*len(ids))})", ids)
-            con.commit()
-            return len(ids)
-
-    # -------- Quiz --------
-    def add_quiz_questions(self, items: list[tuple[str, str, str, str, str, str]]):
-        ts = now_tz().isoformat()
-        with self.conn() as con:
-            con.executemany("""
-                INSERT INTO quiz_questions (question, a, b, c, d, correct, created_at)
-                VALUES (?,?,?,?,?,?,?)
-            """, [(q,a,b,c,d,correct,ts) for (q,a,b,c,d,correct) in items])
-            con.commit()
-
-    def get_random_quiz(self) -> sqlite3.Row | None:
-        with self.conn() as con:
-            return con.execute("SELECT * FROM quiz_questions ORDER BY RANDOM() LIMIT 1").fetchone()
-
-    def delete_last_quiz(self, amount: int) -> int:
-        with self.conn() as con:
-            rows = con.execute("SELECT id FROM quiz_questions ORDER BY id DESC LIMIT ?", (amount,)).fetchall()
-            ids = [r["id"] for r in rows]
-            if not ids:
-                return 0
-            con.execute(f"DELETE FROM quiz_questions WHERE id IN ({','.join('?'*len(ids))})", ids)
-            con.commit()
-            return len(ids)
-
-    def add_score(self, user_id: int, name: str, username: str | None, delta: int):
-        ts = now_tz().isoformat()
-        with self.conn() as con:
-            row = con.execute("SELECT score FROM quiz_scores WHERE user_id=?", (user_id,)).fetchone()
-            if row is None:
-                con.execute("""
-                    INSERT INTO quiz_scores (user_id, name, username, score, updated_at)
-                    VALUES (?,?,?,?,?)
-                """, (user_id, name, username, max(0, delta), ts))
-            else:
-                new_score = int(row["score"]) + delta
-                if new_score < 0:
-                    new_score = 0
-                con.execute("""
-                    UPDATE quiz_scores
-                    SET name=?, username=?, score=?, updated_at=?
-                    WHERE user_id=?
-                """, (name, username, new_score, ts, user_id))
-            con.commit()
-
-    def set_score(self, user_id: int, name: str, username: str | None, score: int):
-        ts = now_tz().isoformat()
-        score = max(0, int(score))
-        with self.conn() as con:
-            con.execute("""
-                INSERT INTO quiz_scores (user_id, name, username, score, updated_at)
-                VALUES (?,?,?,?,?)
-                ON CONFLICT(user_id) DO UPDATE SET
-                    name=excluded.name,
-                    username=excluded.username,
-                    score=excluded.score,
-                    updated_at=excluded.updated_at
-            """, (user_id, name, username, score, ts))
-            con.commit()
-
-    def top_scores(self, limit: int = 10) -> list[sqlite3.Row]:
-        with self.conn() as con:
-            return con.execute("""
-                SELECT name, username, score
-                FROM quiz_scores
-                ORDER BY score DESC, updated_at DESC
-                LIMIT ?
-            """, (limit,)).fetchall()
-
-    # -------- Vote --------
-    def set_vote(self, chat_id: int, question: str, options: list[str]) -> str:
-        vote_id = f"{chat_id}:{int(now_tz().timestamp())}"
-        ts = now_tz().isoformat()
-        with self.conn() as con:
-            con.execute("""
-                INSERT INTO vote_configs (chat_id, vote_id, question, options_json, active, created_at)
-                VALUES (?,?,?,?,1,?)
-                ON CONFLICT(chat_id) DO UPDATE SET
-                    vote_id=excluded.vote_id,
-                    question=excluded.question,
-                    options_json=excluded.options_json,
-                    active=1,
-                    created_at=excluded.created_at
-            """, (chat_id, vote_id, question, json.dumps(options, ensure_ascii=False), ts))
-            con.commit()
-        return vote_id
-
-    def get_vote(self, chat_id: int) -> sqlite3.Row | None:
-        with self.conn() as con:
-            return con.execute("SELECT * FROM vote_configs WHERE chat_id=?", (chat_id,)).fetchone()
-
-    def cast_vote(self, vote_id: str, user_id: int, choice_index: int):
-        ts = now_tz().isoformat()
-        with self.conn() as con:
-            con.execute("""
-                INSERT INTO vote_votes (vote_id, user_id, choice_index, voted_at)
-                VALUES (?,?,?,?)
-                ON CONFLICT(vote_id, user_id) DO UPDATE SET
-                    choice_index=excluded.choice_index,
-                    voted_at=excluded.voted_at
-            """, (vote_id, user_id, choice_index, ts))
-            con.commit()
-
-    def vote_results(self, vote_id: str, options_count: int) -> list[int]:
-        counts = [0] * options_count
-        with self.conn() as con:
-            rows = con.execute("""
-                SELECT choice_index, COUNT(*) as c
-                FROM vote_votes
-                WHERE vote_id=?
-                GROUP BY choice_index
-            """, (vote_id,)).fetchall()
-            for r in rows:
-                idx = int(r["choice_index"])
-                if 0 <= idx < options_count:
-                    counts[idx] = int(r["c"])
-        return counts
-
-    # -------- Stats / Maintenance --------
-    def stats(self) -> dict:
-        with self.conn() as con:
-            users = con.execute("SELECT COUNT(DISTINCT user_id) AS c FROM quiz_scores").fetchone()["c"]
-            chats = con.execute("SELECT COUNT(*) AS c FROM chats").fetchone()["c"]
-            groups = con.execute("SELECT COUNT(*) AS c FROM chats WHERE chat_type IN ('group','supergroup')").fetchone()["c"]
-            return {"users": users, "chats": chats, "groups": groups}
-
-    def list_groups(self) -> list[sqlite3.Row]:
-        with self.conn() as con:
-            return con.execute("""
-                SELECT chat_id, title, chat_type, last_seen
-                FROM chats
-                WHERE chat_type IN ('group','supergroup')
-                ORDER BY last_seen DESC
-            """).fetchall()
-
-    def all_clear(self):
-        with self.conn() as con:
-            con.execute("DELETE FROM contacts")
-            con.execute("DELETE FROM verses")
-            con.execute("DELETE FROM events")
-            con.execute("DELETE FROM birthdays")
-            con.execute("DELETE FROM pray_requests")
-            con.execute("DELETE FROM quiz_questions")
-            con.execute("DELETE FROM quiz_scores")
-            con.execute("DELETE FROM vote_votes")
-            con.execute("DELETE FROM vote_configs")
-            con.execute("DELETE FROM chat_users")
-            con.execute("DELETE FROM chats")
-            con.execute("DELETE FROM chat_settings")
-            con.commit()
-
-
-db = DB(DB_PATH)
-
-# =========================
-# Utilities
-# =========================
-def is_group(chat_type: str) -> bool:
-    return chat_type in (ChatType.GROUP, ChatType.SUPERGROUP)
-
-
-def admin_only(func):
-    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
-        user = update.effective_user
-        if not user or not db.is_admin(user.id):
-            if update.effective_message:
-                await update.effective_message.reply_text("⛔ Admin မဟုတ်သဖြင့် မသုံးနိုင်ပါ။")
-            return ConversationHandler.END
-        return await func(update, context, *args, **kwargs)
-    return wrapper
-
-
-def pick_daily_item(items: list[str], salt: str) -> str | None:
-    if not items:
-        return None
-    key = f"{today_tz().isoformat()}|{salt}"
-    idx = abs(hash(key)) % len(items)
-    return items[idx]
-
-
-def user_display_name(u) -> str:
-    if not u:
-        return "Unknown"
-    name = (u.full_name or "").strip()
-    if not name:
-        name = (u.first_name or "User").strip()
-    return name
-
-
-# =========================
-# Command Texts
-# =========================
-USER_HELP = (
-    "📌 <b>User Commands</b>\n"
-    "• /start - Bot စတင် & နှုတ်ခွန်းဆက်\n"
-    "• /helps - Commands စာရင်း\n"
-    "• /about - အဖွဲ့သမိုင်း/ရည်ရွယ်ချက်\n"
-    "• /contact - တာဝန်ခံများ ဖုန်းနံပါတ်\n"
-    "• /verse - Morning/Night Daily Verse\n"
-    "• /events - လာမည့် အစီအစဉ်များ\n"
-    "• /birthday - ယခုလ မွေးနေ့ရှင်များ\n"
-    "• /pray <text> - ဆုတောင်းတောင်းဆိုရန်\n"
-    "• /praylist - ဆုတောင်းစာရင်း\n"
-    "• /quiz - Quiz ဖြေ (Auto Quiz လည်းရှိ)\n"
-    "• /tops - Quiz Ranking (Name + Score)\n"
-    "• /report - Admin ထံ အကြောင်းကြား\n"
-    "• /all - Group ထဲ active members ကို mention\n"
-    "• /vote - မဲပေးရန် (Button)\n"
-)
-
-ADMIN_HELP = (
-    "🛠️ <b>Admin Commands</b>\n"
-    "• /edit - Admin commands စာရင်း\n"
-    "• /edabout - About ပြင်ရန်\n"
-    "• /edcontact - Contacts ထည့်/ပြင်\n"
-    "• /edverse - Verses ထည့် (M/N)\n"
-    "• /edevents - Events ထည့်/ပြင်\n"
-    "• /edbirthday - Birthdays ထည့်/ပြင်\n"
-    "• /set <number> - Auto Quiz message count သတ်မှတ်\n"
-    "• /edquiz - Quiz ထည့်\n"
-    "• /edpoint <user_id> <score> - Score set\n"
-    "• /broadcast - Groups အားလုံးထံ broadcast\n"
-    "• /stats - Users/Groups stats\n"
-    "• /backup - DB backup file ပို့\n"
-    "• /restore - DB file ဖြင့် restore\n"
-    "• /allclear - Data အကုန်ဖျက် (confirm)\n"
-    "• /delete <type> <amount> - Data ဖျက် (verse/quiz/events/birthday/pray)\n"
-    "• /edadmin <id> - Admin toggle\n"
-    "• /edvote - Vote question/options သတ်မှတ်\n"
-)
-
-# =========================
-# Conversations States
-# =========================
-EDABOUT = 10
-EDCONTACT = 20
-EDVERSE = 30
-EDEVENTS = 40
-EDBIRTHDAY = 50
-EDQUIZ = 60
-BROADCAST = 70
-RESTORE = 80
-EDVOTE = 90
-
-ALLCLEAR_CONFIRM = "ALLCLEAR_CONFIRM"
-
-
-# =========================
-# Core Handlers
-# =========================
-async def track_update(update: Update):
-    """Track chats and users for /all, /broadcast stats etc."""
-    try:
-        chat = update.effective_chat
-        user = update.effective_user
-        if chat:
-            db.upsert_chat(chat.id, chat.title, chat.type)
-        if chat and user:
-            db.upsert_chat_user(chat.id, user.id, user.username, user.first_name, user.last_name)
-    except Exception as e:
-        log.warning("track_update error: %s", e)
-
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await track_update(update)
-    msg = (
-        "🙋‍♂️ <b>Church Community Bot မှ ကြိုဆိုပါတယ်</b>\n\n"
-        "• Commands ကြည့်ရန်: /helps\n"
-        "• Daily Verse: /verse\n"
-        "• Events: /events\n"
-        "• Pray request: /pray <text>\n"
-    )
-    await update.effective_message.reply_text(msg, parse_mode=ParseMode.HTML)
-
-
-async def helps(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await track_update(update)
-    await update.effective_message.reply_text(USER_HELP, parse_mode=ParseMode.HTML)
-
-
-async def about(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await track_update(update)
-    text = db.get_about()
-    await update.effective_message.reply_text(f"📖 <b>About</b>\n\n{text}", parse_mode=ParseMode.HTML)
-
-
-async def contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await track_update(update)
-    rows = db.get_contacts()
-    if not rows:
-        await update.effective_message.reply_text("📞 Contact မသတ်မှတ်ရသေးပါ။ Admin မှ /edcontact ဖြင့် ထည့်ပါ။")
-        return
-    lines = ["📞 <b>Contacts</b>\n"]
-    for r in rows:
-        lines.append(f"• <b>{r['name']}</b> — <code>{r['phone']}</code>")
-    await update.effective_message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
-
-
-async def verse(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await track_update(update)
-    m = db.get_verses("morning")
-    n = db.get_verses("night")
-    mv = pick_daily_item(m, "morning")
-    nv = pick_daily_item(n, "night")
-
-    out = ["📜 <b>Daily Verse</b>\n"]
-    out.append(f"🌅 <b>Morning</b>\n{mv if mv else 'မရှိသေးပါ (Admin: /edverse)'}\n")
-    out.append(f"🌙 <b>Night</b>\n{nv if nv else 'မရှိသေးပါ (Admin: /edverse)'}")
-    await update.effective_message.reply_text("\n".join(out), parse_mode=ParseMode.HTML)
-
-
-async def events(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await track_update(update)
-    rows = db.get_events()
-    if not rows:
-        await update.effective_message.reply_text("📅 Events မရှိသေးပါ။ Admin မှ /edevents ဖြင့် ထည့်ပါ။")
-        return
-    lines = ["📅 <b>Upcoming Events</b>\n"]
-    for r in rows:
-        d = r["event_date"] or ""
-        if d:
-            lines.append(f"• <b>{d}</b> — {r['text']}")
-        else:
-            lines.append(f"• {r['text']}")
-    await update.effective_message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
-
-
-async def birthday(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await track_update(update)
-    month = today_tz().month
-    rows = db.get_birthdays_month(month)
-    if not rows:
-        await update.effective_message.reply_text("🎂 ယခုလ မွေးနေ့ရှင်စာရင်း မရှိသေးပါ။ Admin: /edbirthday")
-        return
-    lines = [f"🎂 <b>{month} လ မွေးနေ့ရှင်များ</b>\n"]
-    for r in rows:
-        lines.append(f"• {r['day']:02d}/{r['month']:02d} — <b>{r['name']}</b>")
-    await update.effective_message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
-
-
-async def pray(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await track_update(update)
-    chat = update.effective_chat
-    user = update.effective_user
-    text = update.effective_message.text or ""
-    m = re.match(r"^/pray(?:@\w+)?\s+(.+)$", text, flags=re.S)
-    if not m:
-        await update.effective_message.reply_text("အသုံးပြုနည်း: /pray <ဆုတောင်းအချက်>")
-        return
-    req = m.group(1).strip()
-    if not req:
-        await update.effective_message.reply_text("ဆုတောင်းအချက် မပါဝင်ပါ။")
-        return
-    db.add_pray(chat.id, user.id, user_display_name(user), user.username, req)
-    await update.effective_message.reply_text("🙏 ဆုတောင်းတောင်းဆိုချက်ကို လက်ခံပြီးပါပြီ။")
-
-
-async def praylist(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await track_update(update)
-    rows = db.get_pray_list(limit=30)
-    if not rows:
-        await update.effective_message.reply_text("🙏 ဆုတောင်းစာရင်း မရှိသေးပါ။")
-        return
-    lines = ["🙏 <b>Pray Requests (Latest)</b>\n"]
-    for r in rows:
-        uname = f"@{r['username']}" if r["username"] else ""
-        created = r["created_at"][:19].replace("T", " ")
-        lines.append(f"• <b>{r['name']}</b> {uname}\n  └ {r['text']}\n  <i>{created}</i>")
-    await update.effective_message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
-
-
-# =========================
-# Quiz (command + auto)
-# =========================
-def quiz_keyboard(qid: int) -> InlineKeyboardMarkup:
-    buttons = [
-        [InlineKeyboardButton("A", callback_data=f"quiz:{qid}:A"),
-         InlineKeyboardButton("B", callback_data=f"quiz:{qid}:B")],
-        [InlineKeyboardButton("C", callback_data=f"quiz:{qid}:C"),
-         InlineKeyboardButton("D", callback_data=f"quiz:{qid}:D")],
-    ]
-    return InlineKeyboardMarkup(buttons)
-
-
-async def send_quiz_to_chat(chat_id: int, context: ContextTypes.DEFAULT_TYPE, force: bool = False):
-    q = db.get_random_quiz()
-    if not q:
-        if force:
-            await context.bot.send_message(chat_id, "🧠 Quiz မရှိသေးပါ။ Admin: /edquiz ဖြင့် ထည့်ပါ။")
-        return
-
-    text = (
-        "🧠 <b>Quiz Time</b>\n\n"
-        f"<b>Q{q['id']}:</b> {q['question']}\n\n"
-        f"A) {q['a']}\n"
-        f"B) {q['b']}\n"
-        f"C) {q['c']}\n"
-        f"D) {q['d']}\n\n"
-        "✅ အဖြေကို Button နဲ့ရွေးပါ။"
-    )
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text=text,
-        parse_mode=ParseMode.HTML,
-        reply_markup=quiz_keyboard(q["id"]),
-    )
-
-
-async def quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await track_update(update)
-    await send_quiz_to_chat(update.effective_chat.id, context, force=True)
-
-
-async def quiz_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await track_update(update)
-    query = update.callback_query
-    await query.answer()
-
-    data = query.data  # quiz:<qid>:<choice>
-    _, qid_str, choice = data.split(":")
-    qid = int(qid_str)
-
-    with db.conn() as con:
-        q = con.execute("SELECT * FROM quiz_questions WHERE id=?", (qid,)).fetchone()
-
-    if not q:
-        await query.edit_message_text("ဒီ Quiz မရှိတော့ပါ။ /quiz ပြန်စမ်းပါ။")
-        return
-
-    user = update.effective_user
-    correct = q["correct"]
-    if choice == correct:
-        db.add_score(user.id, user_display_name(user), user.username, delta=1)
-        verdict = "✅ မှန်ပါတယ်! (+1)"
-    else:
-        verdict = f"❌ မမှန်ပါ။ Correct: <b>{correct}</b>"
-
-    await query.edit_message_text(
-        text=(
-            "🧠 <b>Quiz Result</b>\n\n"
-            f"<b>Q{qid}:</b> {q['question']}\n"
-            f"Your answer: <b>{choice}</b>\n"
-            f"{verdict}"
-        ),
-        parse_mode=ParseMode.HTML,
-    )
-
-
-async def tops(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await track_update(update)
-    rows = db.top_scores(limit=10)
-    if not rows:
-        await update.effective_message.reply_text("🏆 Ranking မရှိသေးပါ။ /quiz ဖြေပါ။")
-        return
-    lines = ["🏆 <b>Top Quiz Ranking</b>\n"]
-    for i, r in enumerate(rows, start=1):
-        uname = f"@{r['username']}" if r["username"] else ""
-        lines.append(f"{i}. <b>{r['name']}</b> {uname} — <b>{r['score']}</b>")
-    await update.effective_message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
-
-
-# =========================
-# Report
-# =========================
-async def report(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await track_update(update)
-    text = update.effective_message.text or ""
-    m = re.match(r"^/report(?:@\w+)?\s+(.+)$", text, flags=re.S)
-    if not m:
-        await update.effective_message.reply_text("အသုံးပြုနည်း: /report <အကြောင်းအရာ>")
-        return
-    body = m.group(1).strip()
-    if not body:
-        await update.effective_message.reply_text("အကြောင်းအရာ မပါဝင်ပါ။")
-        return
-
-    user = update.effective_user
-    chat = update.effective_chat
-    msg = (
-        "📣 <b>User Report</b>\n\n"
-        f"From: <b>{user_display_name(user)}</b> (@{user.username if user.username else '-'})\n"
-        f"UserID: <code>{user.id}</code>\n"
-        f"Chat: <code>{chat.id}</code> ({chat.type})\n\n"
-        f"Message:\n{body}"
-    )
-
-    # Send to ENV admins + DB admins
-    admin_ids = set(ENV_ADMIN_IDS)
-    with db.conn() as con:
-        rows = con.execute("SELECT user_id FROM admins WHERE enabled=1").fetchall()
-        admin_ids.update([int(r["user_id"]) for r in rows])
-
-    sent_any = False
-    for aid in admin_ids:
+        self.conn = sqlite3.connect(self.path, check_same_thread=False)
+        self.conn.row_factory = sqlite3.Row
+        self._init()
+
+    def close(self) -> None:
         try:
-            await context.bot.send_message(aid, msg, parse_mode=ParseMode.HTML)
-            sent_any = True
+            self.conn.close()
         except Exception:
             pass
 
-    if sent_any:
-        await update.effective_message.reply_text("✅ Admin ထံ အကြောင်းကြားပြီးပါပြီ။")
-    else:
-        await update.effective_message.reply_text("⚠️ Admin ဆီ မပို့နိုင်ပါ။ Bot ကို Admin များနဲ့ private chat မှာ /start လုပ်ထားရန်လိုပါတယ်။")
+    def _exec(self, q: str, args: Tuple[Any, ...] = ()) -> sqlite3.Cursor:
+        cur = self.conn.cursor()
+        cur.execute(q, args)
+        self.conn.commit()
+        return cur
+
+    def _init(self) -> None:
+        self._exec("""
+        CREATE TABLE IF NOT EXISTS settings(
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )
+        """)
+        self._exec("""
+        CREATE TABLE IF NOT EXISTS admins(
+            user_id INTEGER PRIMARY KEY,
+            enabled INTEGER NOT NULL DEFAULT 1
+        )
+        """)
+        self._exec("""
+        CREATE TABLE IF NOT EXISTS chats(
+            chat_id INTEGER PRIMARY KEY,
+            title TEXT,
+            type TEXT,
+            added_at TEXT
+        )
+        """)
+        self._exec("""
+        CREATE TABLE IF NOT EXISTS users(
+            user_id INTEGER NOT NULL,
+            chat_id INTEGER NOT NULL,
+            username TEXT,
+            full_name TEXT,
+            last_seen TEXT,
+            PRIMARY KEY(user_id, chat_id)
+        )
+        """)
+        self._exec("""
+        CREATE TABLE IF NOT EXISTS about(
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            text TEXT NOT NULL
+        )
+        """)
+        self._exec("INSERT OR IGNORE INTO about(id, text) VALUES(1, ?)", (
+            "အသင်းတော်/လူငယ်အဖွဲ့ အကြောင်းကို Admin က /edabout နဲ့ ထည့်သွင်းနိုင်ပါတယ်။",
+        ))
+
+        self._exec("""
+        CREATE TABLE IF NOT EXISTS contacts(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            phone TEXT NOT NULL
+        )
+        """)
+        self._exec("""
+        CREATE TABLE IF NOT EXISTS verses(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            vtype TEXT NOT NULL,   -- morning | night
+            text TEXT NOT NULL
+        )
+        """)
+        self._exec("""
+        CREATE TABLE IF NOT EXISTS events(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_date TEXT,       -- YYYY-MM-DD (optional)
+            text TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+        """)
+        self._exec("""
+        CREATE TABLE IF NOT EXISTS birthdays(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            day INTEGER NOT NULL,
+            month INTEGER NOT NULL,
+            note TEXT
+        )
+        """)
+        self._exec("""
+        CREATE TABLE IF NOT EXISTS prayers(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            username TEXT,
+            full_name TEXT,
+            text TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+        """)
+        self._exec("""
+        CREATE TABLE IF NOT EXISTS quiz(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            question TEXT NOT NULL,
+            options_json TEXT NOT NULL,  -- ["A","B","C","D"]
+            answer_index INTEGER NOT NULL, -- 0..3
+            explanation TEXT,
+            created_at TEXT NOT NULL
+        )
+        """)
+        self._exec("""
+        CREATE TABLE IF NOT EXISTS quiz_answers(
+            quiz_id INTEGER NOT NULL,
+            chat_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            chosen_index INTEGER NOT NULL,
+            is_correct INTEGER NOT NULL,
+            answered_at TEXT NOT NULL,
+            PRIMARY KEY(quiz_id, chat_id, user_id)
+        )
+        """)
+        self._exec("""
+        CREATE TABLE IF NOT EXISTS scores(
+            chat_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            username TEXT,
+            full_name TEXT,
+            score INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY(chat_id, user_id)
+        )
+        """)
+        self._exec("""
+        CREATE TABLE IF NOT EXISTS quiz_settings(
+            chat_id INTEGER PRIMARY KEY,
+            threshold INTEGER NOT NULL DEFAULT 0,
+            msg_count INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL
+        )
+        """)
+        self._exec("""
+        CREATE TABLE IF NOT EXISTS reports(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            username TEXT,
+            full_name TEXT,
+            text TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+        """)
+        self._exec("""
+        CREATE TABLE IF NOT EXISTS votes(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER NOT NULL,
+            topic TEXT NOT NULL,
+            options_json TEXT NOT NULL, -- ["name1","name2",...]
+            is_active INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL
+        )
+        """)
+        self._exec("""
+        CREATE TABLE IF NOT EXISTS vote_votes(
+            vote_id INTEGER NOT NULL,
+            chat_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            option_index INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY(vote_id, chat_id, user_id)
+        )
+        """)
+
+        # Bootstrap admins
+        for aid in BOOTSTRAP_ADMIN_IDS:
+            self._exec("INSERT OR IGNORE INTO admins(user_id, enabled) VALUES(?,1)", (aid,))
+
+    # settings
+    def get_setting_int(self, key: str, default: int) -> int:
+        row = self.conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+        if not row:
+            return default
+        try:
+            return int(row["value"])
+        except Exception:
+            return default
+
+    def set_setting(self, key: str, value: str) -> None:
+        self._exec("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
+
+    # admin
+    def is_admin(self, user_id: int) -> bool:
+        row = self.conn.execute("SELECT enabled FROM admins WHERE user_id=?", (user_id,)).fetchone()
+        return bool(row and int(row["enabled"]) == 1)
+
+    def toggle_admin(self, user_id: int) -> bool:
+        row = self.conn.execute("SELECT enabled FROM admins WHERE user_id=?", (user_id,)).fetchone()
+        if not row:
+            self._exec("INSERT INTO admins(user_id, enabled) VALUES(?,1)", (user_id,))
+            return True
+        enabled = int(row["enabled"])
+        new_val = 0 if enabled == 1 else 1
+        self._exec("UPDATE admins SET enabled=? WHERE user_id=?", (new_val, user_id))
+        return new_val == 1
+
+    def list_admins(self) -> List[int]:
+        rows = self.conn.execute("SELECT user_id FROM admins WHERE enabled=1 ORDER BY user_id").fetchall()
+        return [int(r["user_id"]) for r in rows]
+
+    # chats/users
+    def upsert_chat(self, chat_id: int, title: Optional[str], ctype: str) -> None:
+        self._exec(
+            "INSERT INTO chats(chat_id,title,type,added_at) VALUES(?,?,?,?) "
+            "ON CONFLICT(chat_id) DO UPDATE SET title=excluded.title, type=excluded.type",
+            (chat_id, title or "", ctype, utc_now_iso())
+        )
+
+    def upsert_user(self, chat_id: int, user_id: int, username: Optional[str], full_name: str) -> None:
+        self._exec(
+            "INSERT INTO users(user_id,chat_id,username,full_name,last_seen) VALUES(?,?,?,?,?) "
+            "ON CONFLICT(user_id,chat_id) DO UPDATE SET username=excluded.username, full_name=excluded.full_name, last_seen=excluded.last_seen",
+            (user_id, chat_id, username or "", full_name, utc_now_iso())
+        )
+
+    def chat_ids(self) -> List[int]:
+        rows = self.conn.execute("SELECT chat_id FROM chats ORDER BY chat_id").fetchall()
+        return [int(r["chat_id"]) for r in rows]
+
+    def users_in_chat(self, chat_id: int) -> List[sqlite3.Row]:
+        return self.conn.execute(
+            "SELECT user_id, username, full_name FROM users WHERE chat_id=? ORDER BY last_seen DESC",
+            (chat_id,)
+        ).fetchall()
+
+    # about
+    def get_about(self) -> str:
+        row = self.conn.execute("SELECT text FROM about WHERE id=1").fetchone()
+        return row["text"] if row else ""
+
+    def set_about(self, text: str) -> None:
+        self._exec("UPDATE about SET text=? WHERE id=1", (text,))
+
+    # contacts
+    def replace_contacts(self, items: List[Tuple[str, str]]) -> None:
+        self._exec("DELETE FROM contacts")
+        for name, phone in items:
+            self._exec("INSERT INTO contacts(name,phone) VALUES(?,?)", (name, phone))
+
+    def get_contacts(self) -> List[sqlite3.Row]:
+        return self.conn.execute("SELECT name, phone FROM contacts ORDER BY id").fetchall()
+
+    # verses
+    def add_verses(self, verses: List[Tuple[str, str]]) -> int:
+        added = 0
+        for vtype, text in verses:
+            vt = vtype.strip().lower()
+            if vt not in ("morning", "night"):
+                continue
+            self._exec("INSERT INTO verses(vtype,text) VALUES(?,?)", (vt, text.strip()))
+            added += 1
+        return added
+
+    def list_verses(self, vtype: str) -> List[sqlite3.Row]:
+        return self.conn.execute("SELECT id, text FROM verses WHERE vtype=? ORDER BY id", (vtype,)).fetchall()
+
+    def delete_verses(self, amount: int) -> int:
+        rows = self.conn.execute("SELECT id FROM verses ORDER BY id DESC LIMIT ?", (amount,)).fetchall()
+        ids = [int(r["id"]) for r in rows]
+        for i in ids:
+            self._exec("DELETE FROM verses WHERE id=?", (i,))
+        return len(ids)
+
+    # events
+    def replace_events(self, items: List[Tuple[Optional[str], str]]) -> None:
+        self._exec("DELETE FROM events")
+        for d, text in items:
+            self._exec(
+                "INSERT INTO events(event_date,text,created_at) VALUES(?,?,?)",
+                (d or None, text.strip(), utc_now_iso())
+            )
+
+    def upcoming_events(self) -> List[sqlite3.Row]:
+        today = today_ymd().isoformat()
+        # events with date >= today first, then no-date items
+        return self.conn.execute(
+            """
+            SELECT event_date, text FROM events
+            ORDER BY
+                CASE WHEN event_date IS NULL OR event_date='' THEN 1 ELSE 0 END,
+                event_date ASC
+            """
+        ).fetchall()
+
+    # birthdays
+    def replace_birthdays(self, items: List[Tuple[str, int, int, Optional[str]]]) -> None:
+        self._exec("DELETE FROM birthdays")
+        for name, day, month, note in items:
+            self._exec("INSERT INTO birthdays(name,day,month,note) VALUES(?,?,?,?)", (name.strip(), day, month, note or ""))
+
+    def birthdays_in_month(self, month: int) -> List[sqlite3.Row]:
+        return self.conn.execute(
+            "SELECT name, day, month, note FROM birthdays WHERE month=? ORDER BY day ASC, name ASC",
+            (month,)
+        ).fetchall()
+
+    # prayers
+    def add_pray(self, chat_id: int, user_id: int, username: Optional[str], full_name: str, text: str) -> None:
+        self._exec(
+            "INSERT INTO prayers(chat_id,user_id,username,full_name,text,created_at) VALUES(?,?,?,?,?,?)",
+            (chat_id, user_id, username or "", full_name, text.strip(), utc_now_iso())
+        )
+
+    def list_prayers(self, chat_id: int, limit: int = 30) -> List[sqlite3.Row]:
+        return self.conn.execute(
+            "SELECT username, full_name, text, created_at FROM prayers WHERE chat_id=? ORDER BY id DESC LIMIT ?",
+            (chat_id, limit)
+        ).fetchall()
+
+    # quiz
+    def add_quiz_bulk(self, items: List[Tuple[str, List[str], int, Optional[str]]]) -> int:
+        added = 0
+        for q, opts, ans, exp in items:
+            if len(opts) != 4:
+                continue
+            if ans < 0 or ans > 3:
+                continue
+            self._exec(
+                "INSERT INTO quiz(question,options_json,answer_index,explanation,created_at) VALUES(?,?,?,?,?)",
+                (q.strip(), json.dumps(opts, ensure_ascii=False), ans, (exp or "").strip(), utc_now_iso())
+            )
+            added += 1
+        return added
+
+    def delete_quiz(self, amount: int) -> int:
+        rows = self.conn.execute("SELECT id FROM quiz ORDER BY id DESC LIMIT ?", (amount,)).fetchall()
+        ids = [int(r["id"]) for r in rows]
+        for i in ids:
+            self._exec("DELETE FROM quiz WHERE id=?", (i,))
+        return len(ids)
+
+    def random_quiz(self) -> Optional[sqlite3.Row]:
+        row = self.conn.execute("SELECT id, question, options_json, answer_index, explanation FROM quiz ORDER BY RANDOM() LIMIT 1").fetchone()
+        return row
+
+    def has_answered_quiz(self, quiz_id: int, chat_id: int, user_id: int) -> bool:
+        row = self.conn.execute(
+            "SELECT 1 FROM quiz_answers WHERE quiz_id=? AND chat_id=? AND user_id=?",
+            (quiz_id, chat_id, user_id)
+        ).fetchone()
+        return bool(row)
+
+    def record_quiz_answer(self, quiz_id: int, chat_id: int, user_id: int, chosen: int, is_correct: int) -> None:
+        self._exec(
+            "INSERT OR IGNORE INTO quiz_answers(quiz_id,chat_id,user_id,chosen_index,is_correct,answered_at) VALUES(?,?,?,?,?,?)",
+            (quiz_id, chat_id, user_id, chosen, is_correct, utc_now_iso())
+        )
+
+    def add_points(self, chat_id: int, user_id: int, username: Optional[str], full_name: str, delta: int) -> None:
+        row = self.conn.execute("SELECT score FROM scores WHERE chat_id=? AND user_id=?", (chat_id, user_id)).fetchone()
+        if not row:
+            self._exec(
+                "INSERT INTO scores(chat_id,user_id,username,full_name,score,updated_at) VALUES(?,?,?,?,?,?)",
+                (chat_id, user_id, username or "", full_name, max(0, delta), utc_now_iso())
+            )
+            return
+        score = int(row["score"])
+        new_score = max(0, score + delta)
+        self._exec(
+            "UPDATE scores SET score=?, username=?, full_name=?, updated_at=? WHERE chat_id=? AND user_id=?",
+            (new_score, username or "", full_name, utc_now_iso(), chat_id, user_id)
+        )
+
+    def set_points(self, chat_id: int, user_id: int, username: Optional[str], full_name: str, score: int) -> None:
+        self._exec(
+            "INSERT INTO scores(chat_id,user_id,username,full_name,score,updated_at) VALUES(?,?,?,?,?,?) "
+            "ON CONFLICT(chat_id,user_id) DO UPDATE SET score=excluded.score, username=excluded.username, full_name=excluded.full_name, updated_at=excluded.updated_at",
+            (chat_id, user_id, username or "", full_name, max(0, score), utc_now_iso())
+        )
+
+    def top_scores(self, chat_id: int, limit: int = 10) -> List[sqlite3.Row]:
+        return self.conn.execute(
+            "SELECT username, full_name, score FROM scores WHERE chat_id=? ORDER BY score DESC, updated_at ASC LIMIT ?",
+            (chat_id, limit)
+        ).fetchall()
+
+    # quiz auto settings
+    def set_threshold(self, chat_id: int, n: int) -> None:
+        self._exec(
+            "INSERT INTO quiz_settings(chat_id,threshold,msg_count,updated_at) VALUES(?,?,0,?) "
+            "ON CONFLICT(chat_id) DO UPDATE SET threshold=excluded.threshold, updated_at=excluded.updated_at",
+            (chat_id, max(0, n), utc_now_iso())
+        )
+
+    def get_threshold(self, chat_id: int) -> int:
+        row = self.conn.execute("SELECT threshold FROM quiz_settings WHERE chat_id=?", (chat_id,)).fetchone()
+        return int(row["threshold"]) if row else 0
+
+    def inc_msg_count(self, chat_id: int) -> Tuple[int, int]:
+        # returns (threshold, msg_count)
+        row = self.conn.execute("SELECT threshold, msg_count FROM quiz_settings WHERE chat_id=?", (chat_id,)).fetchone()
+        if not row:
+            self._exec("INSERT INTO quiz_settings(chat_id,threshold,msg_count,updated_at) VALUES(?,?,?,?)", (chat_id, 0, 1, utc_now_iso()))
+            return (0, 1)
+        threshold = int(row["threshold"])
+        msg_count = int(row["msg_count"]) + 1
+        self._exec("UPDATE quiz_settings SET msg_count=?, updated_at=? WHERE chat_id=?", (msg_count, utc_now_iso(), chat_id))
+        return (threshold, msg_count)
+
+    def reset_msg_count(self, chat_id: int) -> None:
+        self._exec("UPDATE quiz_settings SET msg_count=0, updated_at=? WHERE chat_id=?", (utc_now_iso(), chat_id))
+
+    # reports
+    def add_report(self, chat_id: int, user_id: int, username: Optional[str], full_name: str, text: str) -> None:
+        self._exec(
+            "INSERT INTO reports(chat_id,user_id,username,full_name,text,created_at) VALUES(?,?,?,?,?,?)",
+            (chat_id, user_id, username or "", full_name, text.strip(), utc_now_iso())
+        )
+
+    # votes
+    def set_vote(self, chat_id: int, topic: str, options: List[str]) -> int:
+        # deactivate previous
+        self._exec("UPDATE votes SET is_active=0 WHERE chat_id=?", (chat_id,))
+        cur = self._exec(
+            "INSERT INTO votes(chat_id,topic,options_json,is_active,created_at) VALUES(?,?,?,?,?)",
+            (chat_id, topic.strip(), json.dumps(options, ensure_ascii=False), 1, utc_now_iso())
+        )
+        return int(cur.lastrowid)
+
+    def get_active_vote(self, chat_id: int) -> Optional[sqlite3.Row]:
+        row = self.conn.execute(
+            "SELECT id, topic, options_json FROM votes WHERE chat_id=? AND is_active=1 ORDER BY id DESC LIMIT 1",
+            (chat_id,)
+        ).fetchone()
+        return row
+
+    def cast_vote(self, vote_id: int, chat_id: int, user_id: int, option_index: int) -> bool:
+        try:
+            self._exec(
+                "INSERT OR REPLACE INTO vote_votes(vote_id,chat_id,user_id,option_index,created_at) VALUES(?,?,?,?,?)",
+                (vote_id, chat_id, user_id, option_index, utc_now_iso())
+            )
+            return True
+        except Exception:
+            return False
+
+    def vote_results(self, vote_id: int, chat_id: int) -> List[sqlite3.Row]:
+        return self.conn.execute(
+            """
+            SELECT option_index, COUNT(*) AS c
+            FROM vote_votes
+            WHERE vote_id=? AND chat_id=?
+            GROUP BY option_index
+            ORDER BY c DESC
+            """,
+            (vote_id, chat_id)
+        ).fetchall()
 
 
-# =========================
-# /all (mention active users)
-# =========================
-async def all_mention(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await track_update(update)
+db = DB(DB_FILE)
+
+# ---------------------------
+# Pending admin actions (in-memory)
+# ---------------------------
+@dataclass
+class PendingAction:
+    action: str
+    chat_id: int
+    extra: Optional[Dict[str, Any]] = None
+
+PENDING: Dict[int, PendingAction] = {}
+
+# ---------------------------
+# Helpers
+# ---------------------------
+def is_group_chat(update: Update) -> bool:
     chat = update.effective_chat
-    if not is_group(chat.type):
-        await update.effective_message.reply_text("/all ကို Group ထဲမှာပဲ သုံးပါ။")
-        return
+    if not chat:
+        return False
+    return chat.type in (ChatType.GROUP, ChatType.SUPERGROUP)
 
-    with db.conn() as con:
-        rows = con.execute("""
-            SELECT user_id, username, first_name, last_name
-            FROM chat_users
-            WHERE chat_id=?
-            ORDER BY last_seen DESC
-            LIMIT 60
-        """, (chat.id,)).fetchall()
+async def send_typing(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_chat:
+        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
 
-    if not rows:
-        await update.effective_message.reply_text("ဒီ Group ထဲ mention လုပ်ရန် user data မရှိသေးပါ။ Member များ စကားပြောပြီးနောက် /all သုံးပါ။")
-        return
+def require_admin(func):
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user = update.effective_user
+        if not user or not db.is_admin(user.id):
+            await update.effective_message.reply_text("⛔ Admin only command ဖြစ်ပါတယ်။")
+            return
+        return await func(update, context)
+    return wrapper
 
-    parts = ["📣 <b>All Members</b>\n"]
-    for r in rows:
-        uid = int(r["user_id"])
-        uname = (r["username"] or "").strip()
-        if uname:
-            parts.append(f"@{uname}")
+def chunk_text(text: str, limit: int = 3500) -> List[str]:
+    parts: List[str] = []
+    buf = ""
+    for line in text.splitlines(True):
+        if len(buf) + len(line) > limit:
+            if buf.strip():
+                parts.append(buf)
+            buf = line
         else:
-            name = " ".join([x for x in [r["first_name"], r["last_name"]] if x]) or "member"
-            # clickable mention without username:
-            parts.append(f'<a href="tg://user?id={uid}">{name}</a>')
+            buf += line
+    if buf.strip():
+        parts.append(buf)
+    return parts
 
-    text = " ".join(parts)
-    await update.effective_message.reply_text(text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+def parse_key_value_lines(raw: str) -> List[Tuple[str, str]]:
+    items: List[Tuple[str, str]] = []
+    for line in raw.splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        if "-" in s:
+            left, right = s.split("-", 1)
+            name = left.strip()
+            value = right.strip()
+            if name and value:
+                items.append((name, value))
+    return items
 
-
-# =========================
-# Vote (user) + edvote (admin)
-# =========================
-def vote_keyboard(vote_id: str, options: list[str]) -> InlineKeyboardMarkup:
-    rows = []
-    for i, opt in enumerate(options):
-        rows.append([InlineKeyboardButton(opt, callback_data=f"vote:{vote_id}:{i}")])
-    rows.append([InlineKeyboardButton("📊 Results", callback_data=f"vote_result:{vote_id}")])
-    return InlineKeyboardMarkup(rows)
-
-
-async def vote(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await track_update(update)
+# ---------------------------
+# Track chats/users on any message
+# ---------------------------
+async def track_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat = update.effective_chat
-    v = db.get_vote(chat.id)
-    if not v or int(v["active"]) != 1:
-        await update.effective_message.reply_text("🗳️ Vote မသတ်မှတ်ရသေးပါ။ Admin: /edvote")
+    user = update.effective_user
+    if not chat or not user:
         return
 
-    options = json.loads(v["options_json"])
-    text = f"🗳️ <b>{v['question']}</b>\n\nရွေးပြီးမဲပေးပါ (Button)👇"
-    await update.effective_message.reply_text(
-        text,
-        parse_mode=ParseMode.HTML,
-        reply_markup=vote_keyboard(v["vote_id"], options),
+    db.upsert_chat(chat.id, chat.title, chat.type)
+    db.upsert_user(
+        chat_id=chat.id,
+        user_id=user.id,
+        username=user.username,
+        full_name=safe_full_name(user.first_name, user.last_name)
     )
 
+# ---------------------------
+# User Commands
+# ---------------------------
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await track_update(update, context)
+    await send_typing(update, context)
 
-async def vote_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await track_update(update)
-    q = update.callback_query
-    await q.answer()
+    msg = (
+        "<b>🙏 Church Community Bot မှ ကြိုဆိုပါတယ်</b>\n\n"
+        "အသုံးပြုလို့ရတဲ့ command များကို <b>/helps</b> နဲ့ကြည့်နိုင်ပါတယ်။\n"
+        "အသင်းတော်အကြောင်း <b>/about</b>\n"
+        "တာဝန်ခံ ဖုန်းနံပါတ် <b>/contact</b>\n"
+        "Daily Verse <b>/verse</b>\n"
+        "Upcoming Events <b>/events</b>\n"
+        "Birthday List <b>/birthday</b>\n"
+        "Prayer Request <b>/pray</b>\n"
+        "Quiz <b>/quiz</b>\n"
+        "Top Scores <b>/tops</b>\n"
+        "Report to Admin <b>/report</b>\n"
+    )
+    await update.effective_message.reply_text(msg)
 
-    if q.data.startswith("vote_result:"):
-        vote_id = q.data.split(":", 1)[1]
-        # Need options to compute
-        with db.conn() as con:
-            row = con.execute("SELECT * FROM vote_configs WHERE vote_id=?", (vote_id,)).fetchone()
-        if not row:
-            await q.edit_message_text("Vote မရှိတော့ပါ။")
-            return
-        options = json.loads(row["options_json"])
-        counts = db.vote_results(vote_id, len(options))
-        total = sum(counts)
-        lines = [f"📊 <b>Vote Results</b>\n<b>{row['question']}</b>\n"]
-        for opt, c in zip(options, counts):
-            pct = (c / total * 100.0) if total > 0 else 0.0
-            lines.append(f"• {opt} — <b>{c}</b> ({pct:.1f}%)")
-        lines.append(f"\nTotal votes: <b>{total}</b>")
-        await q.edit_message_text("\n".join(lines), parse_mode=ParseMode.HTML)
+async def cmd_helps(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await track_update(update, context)
+    await send_typing(update, context)
+
+    text = (
+        "<b>📌 User Commands</b>\n"
+        "/start - Bot စတင်အသုံးပြုရန်\n"
+        "/helps - Command list\n"
+        "/about - အသင်းတော်/လူငယ်အဖွဲ့အကြောင်း\n"
+        "/contact - တာဝန်ခံ ဖုန်းနံပါတ်များ\n"
+        "/verse - ယနေ့ Morning/Night Daily Verse\n"
+        "/events - လာမည့် အသင်းတော်အစီအစဉ်များ\n"
+        "/birthday - ယခုလ မွေးနေ့ရှင်များ\n"
+        "/pray &lt;text&gt; - ဆုတောင်းခံချက် ပို့ရန်\n"
+        "/praylist - ဆုတောင်းခံချက် စာရင်း\n"
+        "/quiz - Quiz ဖြေဆိုရန်\n"
+        "/tops - Quiz Ranking (Name + Score)\n"
+        "/report &lt;text&gt; - Admin ထံ အကြောင်းကြားရန်\n"
+        "/all - Group ထဲက tracked members များကို mention ခေါ်ရန်\n"
+        "/vote - မဲပေးရန် (active vote ရှိလျှင်)\n"
+    )
+    await update.effective_message.reply_text(text)
+
+async def cmd_about(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await track_update(update, context)
+    await send_typing(update, context)
+
+    about = db.get_about()
+    await update.effective_message.reply_text(f"<b>📖 About</b>\n\n{about}")
+
+async def cmd_contact(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await track_update(update, context)
+    await send_typing(update, context)
+
+    rows = db.get_contacts()
+    if not rows:
+        await update.effective_message.reply_text("Contact မရှိသေးပါ။ Admin က /edcontact နဲ့ ထည့်ပေးနိုင်ပါတယ်။")
         return
 
-    # vote:<vote_id>:<idx>
-    _, vote_id, idx_str = q.data.split(":")
-    idx = int(idx_str)
+    lines = ["<b>☎️ Contacts</b>\n"]
+    for r in rows:
+        lines.append(f"• <b>{html.escape(r['name'])}</b> — <code>{html.escape(r['phone'])}</code>")
+    await update.effective_message.reply_text("\n".join(lines))
+
+async def cmd_verse(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await track_update(update, context)
+    await send_typing(update, context)
+
+    morning = db.list_verses("morning")
+    night = db.list_verses("night")
+
+    if not morning and not night:
+        await update.effective_message.reply_text("Verse မရှိသေးပါ။ Admin က /edverse နဲ့ ထည့်နိုင်ပါတယ်။")
+        return
+
+    d = today_ymd()
+    day_index = d.toordinal()
+
+    def pick(rows: List[sqlite3.Row]) -> Optional[str]:
+        if not rows:
+            return None
+        i = day_index % len(rows)
+        return str(rows[i]["text"])
+
+    m = pick(morning)
+    n = pick(night)
+
+    msg = f"<b>📜 Daily Verse</b>\n<b>Date:</b> <code>{d.isoformat()}</code>\n\n"
+    if m:
+        msg += f"<b>🌅 Morning</b>\n{m}\n\n"
+    if n:
+        msg += f"<b>🌙 Night</b>\n{n}\n"
+    await update.effective_message.reply_text(msg)
+
+async def cmd_events(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await track_update(update, context)
+    await send_typing(update, context)
+
+    rows = db.upcoming_events()
+    if not rows:
+        await update.effective_message.reply_text("Events မရှိသေးပါ။ Admin က /edevents နဲ့ ထည့်နိုင်ပါတယ်။")
+        return
+
+    lines = ["<b>🗓 Upcoming Events</b>\n"]
+    for r in rows[:15]:
+        d = (r["event_date"] or "").strip()
+        if d:
+            lines.append(f"• <b>{html.escape(d)}</b> — {html.escape(r['text'])}")
+        else:
+            lines.append(f"• {html.escape(r['text'])}")
+    await update.effective_message.reply_text("\n".join(lines))
+
+async def cmd_birthday(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await track_update(update, context)
+    await send_typing(update, context)
+
+    m = today_ymd().month
+    rows = db.birthdays_in_month(m)
+    if not rows:
+        await update.effective_message.reply_text("ဒီလအတွက် Birthday စာရင်းမရှိသေးပါ။ Admin က /edbirthday နဲ့ ထည့်နိုင်ပါတယ်။")
+        return
+
+    lines = [f"<b>🎂 Birthdays (Month {m})</b>\n"]
+    for r in rows:
+        note = (r["note"] or "").strip()
+        extra = f" — {html.escape(note)}" if note else ""
+        lines.append(f"• <b>{html.escape(r['name'])}</b> — <code>{int(r['day']):02d}/{int(r['month']):02d}</code>{extra}")
+    await update.effective_message.reply_text("\n".join(lines))
+
+async def cmd_pray(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await track_update(update, context)
+
+    chat = update.effective_chat
     user = update.effective_user
-    db.cast_vote(vote_id, user.id, idx)
-    await q.answer("✅ မဲပေးပြီးပါပြီ။", show_alert=True)
+    if not chat or not user:
+        return
 
+    text = " ".join(context.args).strip() if context.args else ""
+    if not text:
+        await update.effective_message.reply_text("အသုံးပြုနည်း: <code>/pray ဆုတောင်းချင်တဲ့အချက်</code>")
+        return
 
-# =========================
-# Auto Quiz Trigger (message counter)
-# =========================
-async def on_any_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await track_update(update)
+    full_name = safe_full_name(user.first_name, user.last_name)
+    db.add_pray(chat.id, user.id, user.username, full_name, text)
+
+    await update.effective_message.reply_text(
+        "<b>✅ Prayer Request လက်ခံပြီးပါပြီ</b>\n"
+        "Admin/အဖွဲ့ဝင်များ ဆုတောင်းပေးနိုင်ရန် /praylist မှာကြည့်နိုင်ပါတယ်။"
+    )
+
+async def cmd_praylist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await track_update(update, context)
+    await send_typing(update, context)
 
     chat = update.effective_chat
     if not chat:
         return
 
-    # only count in groups
-    if is_group(chat.type):
-        s = db.get_settings(chat.id)
-        every = int(s["auto_quiz_every"] or 0)
-        if every > 0:
-            cnt = db.inc_msg_count(chat.id)
-            if cnt >= every:
-                db.reset_msg_count(chat.id)
-                await send_quiz_to_chat(chat.id, context, force=False)
-
-
-# =========================
-# Admin: /edit help
-# =========================
-@admin_only
-async def edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await track_update(update)
-    await update.effective_message.reply_text(ADMIN_HELP, parse_mode=ParseMode.HTML)
-
-
-# =========================
-# Admin: /edabout (conversation)
-# =========================
-@admin_only
-async def edabout_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await track_update(update)
-    await update.effective_message.reply_text(
-        "📝 About ကို အသစ်ရေးပေးပါ (စာအရှည် OK)။\nပြီးရင် message တစ်ခုတည်းနဲ့ ပို့ပါ။\nCancel: /cancel"
-    )
-    return EDABOUT
-
-
-@admin_only
-async def edabout_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await track_update(update)
-    text = (update.effective_message.text or "").strip()
-    if not text:
-        await update.effective_message.reply_text("စာမပါဝင်ပါ။ ပြန်ပို့ပါ။")
-        return EDABOUT
-    db.set_about(text)
-    await update.effective_message.reply_text("✅ About ကို သိမ်းပြီးပါပြီ။")
-    return ConversationHandler.END
-
-
-# =========================
-# Admin: /edcontact
-# =========================
-@admin_only
-async def edcontact_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await track_update(update)
-    await update.effective_message.reply_text(
-        "📞 Contacts ထည့်/ပြင်ရန်\n"
-        "Line တစ်ကြောင်းစီကို ဒီပုံစံနဲ့ ပို့ပါ:\n"
-        "<Name> - <Phone>\n\n"
-        "ဥပမာ:\n"
-        "Ko Aung - 09xxxxxxx\n"
-        "Ma Su - 09yyyyyyy\n\n"
-        "ပြီးရင် message တစ်ခုတည်းနဲ့ ပို့ပါ။\nCancel: /cancel"
-    )
-    return EDCONTACT
-
-
-@admin_only
-async def edcontact_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await track_update(update)
-    raw = (update.effective_message.text or "").strip()
-    items = []
-    for line in raw.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        if "-" not in line:
-            continue
-        name, phone = [x.strip() for x in line.split("-", 1)]
-        if name and phone:
-            items.append((name, phone))
-    if not items:
-        await update.effective_message.reply_text("Format မမှန်ပါ။ နမူနာအတိုင်း ပြန်ပို့ပါ။")
-        return EDCONTACT
-    db.set_contacts(items)
-    await update.effective_message.reply_text(f"✅ Contacts ({len(items)}) ခု သိမ်းပြီးပါပြီ။")
-    return ConversationHandler.END
-
-
-# =========================
-# Admin: /edverse
-# =========================
-@admin_only
-async def edverse_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await track_update(update)
-    await update.effective_message.reply_text(
-        "📜 Verses ထည့်ရန်\n"
-        "Line တစ်ကြောင်းစီကို ဒီပုံစံနဲ့ ပို့ပါ:\n"
-        "M| <Morning Verse>\n"
-        "N| <Night Verse>\n\n"
-        "ဥပမာ:\n"
-        "M| Psalm 23:1 ...\n"
-        "N| John 3:16 ...\n\n"
-        "Message တစ်ခုတည်းနဲ့ ပို့ပါ။ (တစ်ခုထက်မက OK)\nCancel: /cancel"
-    )
-    return EDVERSE
-
-
-@admin_only
-async def edverse_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await track_update(update)
-    raw = (update.effective_message.text or "").strip()
-    morning = []
-    night = []
-    for line in raw.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        if line.startswith("M|") or line.startswith("m|"):
-            t = line.split("|", 1)[1].strip()
-            if t:
-                morning.append(t)
-        elif line.startswith("N|") or line.startswith("n|"):
-            t = line.split("|", 1)[1].strip()
-            if t:
-                night.append(t)
-
-    if not morning and not night:
-        await update.effective_message.reply_text("M| / N| format မတွေ့ပါ။ ပြန်ပို့ပါ။")
-        return EDVERSE
-
-    if morning:
-        db.add_verses("morning", morning)
-    if night:
-        db.add_verses("night", night)
-
-    await update.effective_message.reply_text(f"✅ Verse သိမ်းပြီးပါပြီ (Morning {len(morning)} / Night {len(night)})")
-    return ConversationHandler.END
-
-
-# =========================
-# Admin: /edevents
-# =========================
-@admin_only
-async def edevents_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await track_update(update)
-    await update.effective_message.reply_text(
-        "📅 Events ထည့်/ပြင်ရန်\n"
-        "Message တစ်ခုတည်းနဲ့ line တစ်ကြောင်းစီ ပို့ပါ။\n\n"
-        "Format:\n"
-        "YYYY-MM-DD | <Event Text>\n"
-        "date မသိရင်:\n"
-        "| <Event Text>\n\n"
-        "ဥပမာ:\n"
-        "2026-03-01 | Sunday Service 9AM\n"
-        "| Youth Fellowship (time TBD)\n\n"
-        "ဒီ command က old events အကုန် replace လုပ်ပါမယ်။\nCancel: /cancel"
-    )
-    return EDEVENTS
-
-
-@admin_only
-async def edevents_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await track_update(update)
-    raw = (update.effective_message.text or "").strip()
-    items = []
-    for line in raw.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        if "|" not in line:
-            continue
-        left, right = [x.strip() for x in line.split("|", 1)]
-        d = left if left else None
-        t = right
-        if not t:
-            continue
-        if d:
-            # quick validate
-            if not re.match(r"^\d{4}-\d{2}-\d{2}$", d):
-                d = None
-        items.append((d, t))
-
-    if not items:
-        await update.effective_message.reply_text("Format မမှန်ပါ။ နမူနာအတိုင်း ပြန်ပို့ပါ။")
-        return EDEVENTS
-
-    db.set_events(items)
-    await update.effective_message.reply_text(f"✅ Events ({len(items)}) ခု သိမ်းပြီးပါပြီ။")
-    return ConversationHandler.END
-
-
-# =========================
-# Admin: /edbirthday
-# =========================
-@admin_only
-async def edbirthday_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await track_update(update)
-    await update.effective_message.reply_text(
-        "🎂 Birthdays ထည့်/ပြင်ရန်\n"
-        "Line တစ်ကြောင်းစီ:\n"
-        "<Name> | MM-DD\n\n"
-        "ဥပမာ:\n"
-        "Ko Aung | 03-15\n"
-        "Ma Su   | 03-29\n\n"
-        "ဒီ command က old list အကုန် replace လုပ်ပါမယ်။\nCancel: /cancel"
-    )
-    return EDBIRTHDAY
-
-
-@admin_only
-async def edbirthday_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await track_update(update)
-    raw = (update.effective_message.text or "").strip()
-    items = []
-    for line in raw.splitlines():
-        line = line.strip()
-        if not line or "|" not in line:
-            continue
-        name, md = [x.strip() for x in line.split("|", 1)]
-        m = re.match(r"^(\d{2})-(\d{2})$", md)
-        if not (name and m):
-            continue
-        month = int(m.group(1))
-        day = int(m.group(2))
-        if 1 <= month <= 12 and 1 <= day <= 31:
-            items.append((name, month, day))
-
-    if not items:
-        await update.effective_message.reply_text("Format မမှန်ပါ။ နမူနာအတိုင်း ပြန်ပို့ပါ။")
-        return EDBIRTHDAY
-
-    db.set_birthdays(items)
-    await update.effective_message.reply_text(f"✅ Birthdays ({len(items)}) ခု သိမ်းပြီးပါပြီ။")
-    return ConversationHandler.END
-
-
-# =========================
-# Admin: /set <number>
-# =========================
-@admin_only
-async def set_auto_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await track_update(update)
-    chat = update.effective_chat
-    args = context.args
-    if not args or not args[0].isdigit():
-        await update.effective_message.reply_text("အသုံးပြုနည်း: /set <number>\nဥပမာ: /set 50\n(0 ဆို auto quiz ပိတ်)")
+    rows = db.list_prayers(chat.id, limit=30)
+    if not rows:
+        await update.effective_message.reply_text("Prayer Request မရှိသေးပါ။")
         return
-    n = int(args[0])
-    if n < 0:
-        n = 0
-    db.set_auto_quiz_every(chat.id, n)
-    await update.effective_message.reply_text(f"✅ Auto Quiz message count = {n} သတ်မှတ်ပြီးပါပြီ။")
 
+    lines = ["<b>🙏 Prayer List (Latest)</b>\n"]
+    for r in rows[::-1]:
+        name = (r["full_name"] or "").strip()
+        uname = (r["username"] or "").strip()
+        who = html.escape(name)
+        if uname:
+            who += f" (<code>@{html.escape(uname)}</code>)"
+        lines.append(f"• <b>{who}</b>\n  {html.escape(r['text'])}")
+    msg = "\n".join(lines)
+    for part in chunk_text(msg):
+        await update.effective_message.reply_text(part)
 
-# =========================
-# Admin: /edquiz
-# =========================
-@admin_only
-async def edquiz_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await track_update(update)
-    await update.effective_message.reply_text(
-        "🧠 Quiz ထည့်ရန် (တစ်ခုထက်မက OK)\n"
-        "Format (Block တစ်ခုချင်းစီကို blank line နဲ့ ခွဲနိုင်):\n"
-        "Q: ...\n"
-        "A: ...\n"
-        "B: ...\n"
-        "C: ...\n"
-        "D: ...\n"
-        "Correct: A/B/C/D\n\n"
-        "ဥပမာ:\n"
-        "Q: Jesus was born in?\n"
-        "A: Jerusalem\nB: Bethlehem\nC: Nazareth\nD: Rome\n"
-        "Correct: B\n\n"
-        "Message တစ်ခုတည်းနဲ့ ပို့ပါ။\nCancel: /cancel"
-    )
-    return EDQUIZ
-
-
-def parse_quiz_blocks(raw: str):
-    blocks = re.split(r"\n\s*\n", raw.strip())
-    items = []
-    for b in blocks:
-        lines = [x.strip() for x in b.splitlines() if x.strip()]
-        data = {}
-        for ln in lines:
-            if ":" not in ln:
-                continue
-            k, v = [x.strip() for x in ln.split(":", 1)]
-            data[k.upper()] = v
-        if "Q" in data and "A" in data and "B" in data and "C" in data and "D" in data and "CORRECT" in data:
-            c = data["CORRECT"].upper()
-            if c in ("A", "B", "C", "D"):
-                items.append((data["Q"], data["A"], data["B"], data["C"], data["D"], c))
-    return items
-
-
-@admin_only
-async def edquiz_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await track_update(update)
-    raw = (update.effective_message.text or "").strip()
-    items = parse_quiz_blocks(raw)
-    if not items:
-        await update.effective_message.reply_text("Quiz format မမှန်ပါ။ နမူနာအတိုင်း ပြန်ပို့ပါ။")
-        return EDQUIZ
-    db.add_quiz_questions(items)
-    await update.effective_message.reply_text(f"✅ Quiz ({len(items)}) ခု ထည့်ပြီးပါပြီ။")
-    return ConversationHandler.END
-
-
-# =========================
-# Admin: /edpoint <user_id> <score>
-# =========================
-@admin_only
-async def edpoint(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await track_update(update)
-    args = context.args
-    if len(args) < 2 or (not args[0].isdigit()) or (not re.match(r"^-?\d+$", args[1])):
-        await update.effective_message.reply_text("အသုံးပြုနည်း: /edpoint <user_id> <score>\nဥပမာ: /edpoint 12345678 10")
+async def send_quiz_to_chat(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
+    row = db.random_quiz()
+    if not row:
+        await context.bot.send_message(chat_id=chat_id, text="Quiz မရှိသေးပါ။ Admin က /edquiz နဲ့ထည့်ပါ။")
         return
-    user_id = int(args[0])
-    score = int(args[1])
-    # name unknown; keep user_id as name if not found
-    name = f"User {user_id}"
-    username = None
-    db.set_score(user_id, name, username, score)
-    await update.effective_message.reply_text("✅ Score set ပြီးပါပြီ။")
 
+    quiz_id = int(row["id"])
+    question = str(row["question"])
+    options = json.loads(row["options_json"])
 
-# =========================
-# Admin: /broadcast (conversation)
-# =========================
-@admin_only
-async def broadcast_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await track_update(update)
-    await update.effective_message.reply_text(
-        "📣 Broadcast လုပ်မည့် message ကို <b>နောက် message</b> အဖြစ် ပို့ပါ။\n"
-        "Text/Photo (caption)/Document အားလုံး OK.\nCancel: /cancel",
-        parse_mode=ParseMode.HTML,
-    )
-    return BROADCAST
-
-
-@admin_only
-async def broadcast_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await track_update(update)
-    groups = db.list_groups()
-    if not groups:
-        await update.effective_message.reply_text("Group စာရင်း မရှိသေးပါ။ Bot ကို group ထဲထည့်ပြီး message တစ်ချို့လာမှ stats ထဲဝင်ပါမယ်။")
-        return ConversationHandler.END
-
-    msg = update.effective_message
-    ok = 0
-    fail = 0
-
-    for g in groups:
-        gid = int(g["chat_id"])
-        try:
-            # Copy message preserves media/caption nicely
-            await msg.copy(chat_id=gid)
-            ok += 1
-        except Exception:
-            fail += 1
-
-    await update.effective_message.reply_text(f"✅ Broadcast ပြီးပါပြီ။ Success: {ok} | Fail: {fail}")
-    return ConversationHandler.END
-
-
-# =========================
-# Admin: /stats
-# =========================
-@admin_only
-async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await track_update(update)
-    s = db.stats()
-    groups = db.list_groups()
-    lines = [
-        "📊 <b>Bot Stats</b>\n",
-        f"• Users (scored): <b>{s['users']}</b>",
-        f"• Chats tracked: <b>{s['chats']}</b>",
-        f"• Groups: <b>{s['groups']}</b>\n",
-        "<b>Groups List</b>:"
+    keyboard = [
+        [InlineKeyboardButton(f"A) {options[0]}", callback_data=f"quiz:{quiz_id}:0"),
+         InlineKeyboardButton(f"B) {options[1]}", callback_data=f"quiz:{quiz_id}:1")],
+        [InlineKeyboardButton(f"C) {options[2]}", callback_data=f"quiz:{quiz_id}:2"),
+         InlineKeyboardButton(f"D) {options[3]}", callback_data=f"quiz:{quiz_id}:3")],
+        [InlineKeyboardButton("📊 Ranking (/tops)", callback_data="noop"),
+         InlineKeyboardButton("ℹ️ Help (/helps)", callback_data="noop")]
     ]
-    for g in groups[:20]:
-        lines.append(f"• <code>{g['chat_id']}</code> — {g['title'] or '-'}")
-    if len(groups) > 20:
-        lines.append(f"... and {len(groups)-20} more")
-    await update.effective_message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
-
-
-# =========================
-# Admin: /backup
-# =========================
-@admin_only
-async def backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await track_update(update)
-    if not os.path.exists(DB_PATH):
-        await update.effective_message.reply_text("DB file မတွေ့ပါ။")
-        return
-    await update.effective_message.reply_document(
-        document=InputFile(DB_PATH),
-        filename=os.path.basename(DB_PATH),
-        caption="🗄️ Backup DB file",
+    text = "<b>🧠 Quiz Time</b>\n\n" + html.escape(question)
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=text,
+        reply_markup=InlineKeyboardMarkup(keyboard),
     )
 
+async def cmd_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await track_update(update, context)
+    await send_typing(update, context)
 
-# =========================
-# Admin: /restore (conversation)
-# =========================
-@admin_only
-async def restore_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await track_update(update)
-    await update.effective_message.reply_text(
-        "♻️ Restore လုပ်ရန် .db file ကို <b>နောက် message</b> အဖြစ် Document အနေနဲ့ ပို့ပါ။\n"
-        "⚠️ လက်ရှိ DB ကို အစားထိုးပါမယ်။\nCancel: /cancel",
-        parse_mode=ParseMode.HTML,
-    )
-    return RESTORE
-
-
-@admin_only
-async def restore_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await track_update(update)
-    doc = update.effective_message.document
-    if not doc:
-        await update.effective_message.reply_text("DB file (Document) မတွေ့ပါ။ ပြန်ပို့ပါ။")
-        return RESTORE
-
-    if not doc.file_name.lower().endswith(".db"):
-        await update.effective_message.reply_text("⚠️ .db file ပဲ ပို့ပါ။")
-        return RESTORE
-
-    # download to temp then replace
-    tmp_path = f"{DB_PATH}.restore_tmp"
-    f = await doc.get_file()
-    await f.download_to_drive(custom_path=tmp_path)
-
-    # quick open test
-    try:
-        con = sqlite3.connect(tmp_path)
-        con.execute("SELECT name FROM sqlite_master LIMIT 1;").fetchone()
-        con.close()
-    except Exception:
-        os.remove(tmp_path)
-        await update.effective_message.reply_text("❌ DB file မမှန်ပါ။")
-        return ConversationHandler.END
-
-    # replace
-    shutil.copyfile(tmp_path, DB_PATH)
-    os.remove(tmp_path)
-
-    # re-init (tables exist check)
-    global db
-    db = DB(DB_PATH)
-
-    await update.effective_message.reply_text("✅ Restore ပြီးပါပြီ။")
-    return ConversationHandler.END
-
-
-# =========================
-# Admin: /allclear (confirm)
-# =========================
-@admin_only
-async def allclear(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await track_update(update)
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("⚠️ YES, DELETE ALL", callback_data=ALLCLEAR_CONFIRM)],
-        [InlineKeyboardButton("Cancel", callback_data="cancel_allclear")]
-    ])
-    await update.effective_message.reply_text(
-        "⚠️ Data အကုန်ဖျက်မလား?\n"
-        "Contacts/Verses/Events/Birthdays/Pray/Quiz/Scores/Votes/Chats tracking အကုန်ဖျက်ပါမယ်။",
-        reply_markup=kb
-    )
-
-
-async def allclear_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await track_update(update)
-    q = update.callback_query
-    user = update.effective_user
-    if not db.is_admin(user.id):
-        await q.answer("Admin မဟုတ်ပါ။", show_alert=True)
-        return
-    await q.answer()
-    if q.data == ALLCLEAR_CONFIRM:
-        db.all_clear()
-        await q.edit_message_text("✅ All data cleared.")
-    else:
-        await q.edit_message_text("Cancelled.")
-
-
-# =========================
-# Admin: /delete <type> <amount>
-# types: verse_morning, verse_night, quiz, events, birthday, pray
-# =========================
-@admin_only
-async def delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await track_update(update)
-    args = context.args
-    if len(args) < 2 or not args[1].isdigit():
-        await update.effective_message.reply_text(
-            "အသုံးပြုနည်း: /delete <type> <amount>\n"
-            "type: verse_morning | verse_night | quiz | events | birthday | pray\n"
-            "ဥပမာ: /delete quiz 10"
-        )
-        return
-    tp = args[0].lower()
-    amount = int(args[1])
-    if amount <= 0:
-        await update.effective_message.reply_text("amount သတ်မှတ်ချက် မမှန်ပါ။")
-        return
-
-    if tp == "verse_morning":
-        n = db.delete_last_verses("morning", amount)
-    elif tp == "verse_night":
-        n = db.delete_last_verses("night", amount)
-    elif tp == "quiz":
-        n = db.delete_last_quiz(amount)
-    elif tp == "events":
-        n = db.delete_last_events(amount)
-    elif tp == "birthday":
-        n = db.delete_last_birthdays(amount)
-    elif tp == "pray":
-        n = db.delete_last_pray(amount)
-    else:
-        await update.effective_message.reply_text("type မမှန်ပါ။")
-        return
-
-    await update.effective_message.reply_text(f"✅ Deleted: {n} item(s).")
-
-
-# =========================
-# Admin: /edadmin <id> (toggle)
-# =========================
-@admin_only
-async def edadmin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await track_update(update)
-    args = context.args
-    if not args or not args[0].isdigit():
-        await update.effective_message.reply_text("အသုံးပြုနည်း: /edadmin <user_id>")
-        return
-    uid = int(args[0])
-    msg = db.toggle_admin(uid)
-    await update.effective_message.reply_text(msg)
-
-
-# =========================
-# Admin: /edvote (conversation)
-# =========================
-@admin_only
-async def edvote_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await track_update(update)
-    await update.effective_message.reply_text(
-        "🗳️ Vote သတ်မှတ်ရန်\n"
-        "Format:\n"
-        "Question: ...\n"
-        "Options:\n"
-        "- Name1\n"
-        "- Name2\n"
-        "- Name3\n"
-        "(၃-၅ ခု)\n\n"
-        "Message တစ်ခုတည်းနဲ့ ပို့ပါ။\nCancel: /cancel"
-    )
-    return EDVOTE
-
-
-@admin_only
-async def edvote_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await track_update(update)
     chat = update.effective_chat
-    raw = (update.effective_message.text or "").strip()
+    if not chat:
+        return
+    await send_quiz_to_chat(chat.id, context)
 
-    qmatch = re.search(r"(?im)^question:\s*(.+)$", raw)
-    if not qmatch:
-        await update.effective_message.reply_text("Question: ... မတွေ့ပါ။")
-        return EDVOTE
-    question = qmatch.group(1).strip()
+async def cmd_tops(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await track_update(update, context)
+    await send_typing(update, context)
 
-    opts = []
-    in_opts = False
-    for line in raw.splitlines():
-        ln = line.strip()
-        if re.match(r"(?im)^options:\s*$", ln):
-            in_opts = True
+    chat = update.effective_chat
+    if not chat:
+        return
+
+    rows = db.top_scores(chat.id, limit=10)
+    if not rows:
+        await update.effective_message.reply_text("Score မရှိသေးပါ။ /quiz ဖြေပြီး စတင်ရယူနိုင်ပါတယ်။")
+        return
+
+    lines = ["<b>🏆 Top Scores</b>\n"]
+    rank = 1
+    for r in rows:
+        name = (r["full_name"] or "").strip()
+        uname = (r["username"] or "").strip()
+        who = html.escape(name if name else "Unknown")
+        if uname:
+            who += f" (<code>@{html.escape(uname)}</code>)"
+        lines.append(f"{rank}. <b>{who}</b> — <b>{int(r['score'])}</b>")
+        rank += 1
+    await update.effective_message.reply_text("\n".join(lines))
+
+async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await track_update(update, context)
+
+    chat = update.effective_chat
+    user = update.effective_user
+    if not chat or not user:
+        return
+
+    text = " ".join(context.args).strip() if context.args else ""
+    if not text:
+        await update.effective_message.reply_text("အသုံးပြုနည်း: <code>/report မိမိအကြောင်းကြားလိုသောအချက်</code>")
+        return
+
+    full_name = safe_full_name(user.first_name, user.last_name)
+    db.add_report(chat.id, user.id, user.username, full_name, text)
+
+    admins = db.list_admins()
+    msg = (
+        "<b>📣 New Report</b>\n"
+        f"<b>Chat:</b> <code>{chat.id}</code>\n"
+        f"<b>From:</b> {mention_html(user.id, full_name)}"
+    )
+    if user.username:
+        msg += f" (<code>@{html.escape(user.username)}</code>)"
+    msg += "\n\n" + html.escape(text)
+
+    delivered = 0
+    for aid in admins:
+        try:
+            await context.bot.send_message(chat_id=aid, text=msg)
+            delivered += 1
+        except Exception:
             continue
-        if in_opts:
-            m = re.match(r"^-+\s*(.+)$", ln)
-            if m:
-                opts.append(m.group(1).strip())
 
-    opts = [o for o in opts if o]
-    if not (3 <= len(opts) <= 5):
-        await update.effective_message.reply_text("Options ၃-၅ ခု လိုပါတယ်။")
-        return EDVOTE
+    await update.effective_message.reply_text(
+        f"✅ Admin ထံ အကြောင်းကြားပြီးပါပြီ။ (sent to {delivered} admin(s))"
+    )
 
-    vote_id = db.set_vote(chat.id, question, opts)
-    await update.effective_message.reply_text(f"✅ Vote set ပြီးပါပြီ။ (/vote)\nVoteID: {vote_id}")
-    return ConversationHandler.END
+async def cmd_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await track_update(update, context)
+    await send_typing(update, context)
 
+    chat = update.effective_chat
+    if not chat:
+        return
+    if not is_group_chat(update):
+        await update.effective_message.reply_text("/all ကို Group/Supergroup ထဲမှာသာ အသုံးပြုနိုင်ပါတယ်။")
+        return
 
-# =========================
-# Cancel conversation
-# =========================
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await track_update(update)
-    await update.effective_message.reply_text("Cancelled.")
-    return ConversationHandler.END
+    rows = db.users_in_chat(chat.id)
+    if not rows:
+        await update.effective_message.reply_text("Member list မရှိသေးပါ။ အဖွဲ့ဝင်တွေ message ပို့ပြီးမှ track လုပ်နိုင်ပါတယ်။")
+        return
 
+    # build mention chunks
+    mentions: List[str] = []
+    for r in rows:
+        uid = int(r["user_id"])
+        name = (r["full_name"] or "").strip() or (r["username"] or "").strip() or str(uid)
+        mentions.append(mention_html(uid, name))
 
-# =========================
-# App Setup
-# =========================
-def build_app():
-    if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN not set. Put it in .env")
+    # send in chunks to avoid 4096 limit
+    chunk: List[str] = []
+    size = 0
+    sent = 0
+    for m in mentions:
+        if size + len(m) + 2 > 3500:
+            text = "<b>📣 @all</b>\n" + " ".join(chunk)
+            await update.effective_message.reply_text(text)
+            sent += 1
+            chunk = [m]
+            size = len(m)
+        else:
+            chunk.append(m)
+            size += len(m) + 1
 
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    if chunk:
+        text = "<b>📣 @all</b>\n" + " ".join(chunk)
+        await update.effective_message.reply_text(text)
+        sent += 1
 
-    # User commands
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("helps", helps))
-    app.add_handler(CommandHandler("about", about))
-    app.add_handler(CommandHandler("contact", contact))
-    app.add_handler(CommandHandler("verse", verse))
-    app.add_handler(CommandHandler("events", events))
-    app.add_handler(CommandHandler("birthday", birthday))
-    app.add_handler(CommandHandler("pray", pray))
-    app.add_handler(CommandHandler("praylist", praylist))
-    app.add_handler(CommandHandler("quiz", quiz))
-    app.add_handler(CallbackQueryHandler(quiz_callback, pattern=r"^quiz:\d+:[ABCD]$"))
-    app.add_handler(CommandHandler("tops", tops))
-    app.add_handler(CommandHandler("report", report))
-    app.add_handler(CommandHandler("all", all_mention))
-    app.add_handler(CommandHandler("vote", vote))
-    app.add_handler(CallbackQueryHandler(vote_callback, pattern=r"^(vote:|vote_result:)"))
+async def cmd_vote(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await track_update(update, context)
+    await send_typing(update, context)
 
-    # Admin commands (some are conversations)
-    app.add_handler(CommandHandler("edit", edit))
-    app.add_handler(CommandHandler("set", set_auto_quiz))
-    app.add_handler(CommandHandler("edpoint", edpoint))
-    app.add_handler(CommandHandler("stats", stats))
-    app.add_handler(CommandHandler("backup", backup))
-    app.add_handler(CommandHandler("allclear", allclear))
-    app.add_handler(CallbackQueryHandler(allclear_callback, pattern=r"^(ALLCLEAR_CONFIRM|cancel_allclear)$"))
-    app.add_handler(CommandHandler("delete", delete))
-    app.add_handler(CommandHandler("edadmin", edadmin))
+    chat = update.effective_chat
+    if not chat:
+        return
 
-    # Conversations
-    app.add_handler(ConversationHandler(
-        entry_points=[CommandHandler("edabout", edabout_start)],
-        states={EDABOUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, edabout_save)]},
-        fallbacks=[CommandHandler("cancel", cancel)],
-    ))
+    row = db.get_active_vote(chat.id)
+    if not row:
+        await update.effective_message.reply_text("Active vote မရှိသေးပါ။ Admin က /edvote နဲ့ သတ်မှတ်နိုင်ပါတယ်။")
+        return
 
-    app.add_handler(ConversationHandler(
-        entry_points=[CommandHandler("edcontact", edcontact_start)],
-        states={EDCONTACT: [MessageHandler(filters.TEXT & ~filters.COMMAND, edcontact_save)]},
-        fallbacks=[CommandHandler("cancel", cancel)],
-    ))
+    vote_id = int(row["id"])
+    topic = str(row["topic"])
+    options = json.loads(row["options_json"])
 
-    app.add_handler(ConversationHandler(
-        entry_points=[CommandHandler("edverse", edverse_start)],
-        states={EDVERSE: [MessageHandler(filters.TEXT & ~filters.COMMAND, edverse_save)]},
-        fallbacks=[CommandHandler("cancel", cancel)],
-    ))
+    keyboard: List[List[InlineKeyboardButton]] = []
+    for i, opt in enumerate(options):
+        keyboard.append([InlineKeyboardButton(opt, callback_data=f"vote:{vote_id}:{i}")])
 
-    app.add_handler(ConversationHandler(
-        entry_points=[CommandHandler("edevents", edevents_start)],
-        states={EDEVENTS: [MessageHandler(filters.TEXT & ~filters.COMMAND, edevents_save)]},
-        fallbacks=[CommandHandler("cancel", cancel)],
-    ))
+    keyboard.append([
+        InlineKeyboardButton("📊 View Results", callback_data=f"vote_res:{vote_id}"),
+    ])
 
-    app.add_handler(ConversationHandler(
-        entry_points=[CommandHandler("edbirthday", edbirthday_start)],
-        states={EDBIRTHDAY: [MessageHandler(filters.TEXT & ~filters.COMMAND, edbirthday_save)]},
-        fallbacks=[CommandHandler("cancel", cancel)],
-    ))
+    await update.effective_message.reply_text(
+        f"<b>🗳 Vote</b>\n\n<b>Topic:</b> {html.escape(topic)}\n\nရွေးချယ်ပြီး မဲပေးနိုင်ပါတယ်။",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
 
-    app.add_handler(ConversationHandler(
-        entry_points=[CommandHandler("edquiz", edquiz_start)],
-        states={EDQUIZ: [MessageHandler(filters.TEXT & ~filters.COMMAND, edquiz_save)]},
-        fallbacks=[CommandHandler("cancel", cancel)],
-    ))
+# ---------------------------
+# Admin Commands
+# ---------------------------
+@require_admin
+async def cmd_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await track_update(update, context)
+    await send_typing(update, context)
 
-    app.add_handler(ConversationHandler(
-        entry_points=[CommandHandler("broadcast", broadcast_start)],
-        states={BROADCAST: [MessageHandler(~filters.COMMAND, broadcast_send)]},
-        fallbacks=[CommandHandler("cancel", cancel)],
-    ))
+    text = (
+        "<b>🛠 Admin Commands</b>\n"
+        "/edit - Admin commands list\n"
+        "/edabout - About ပြင်ရန် (next message)\n"
+        "/edcontact - Contacts ထည့်/ပြင်ရန် (next message)\n"
+        "/edverse - Verses ထည့်ရန် (next message, multiple)\n"
+        "/edevents - Events ထည့်/ပြင်ရန် (next message)\n"
+        "/edbirthday - Birthday list ထည့်/ပြင်ရန် (next message)\n"
+        "/set &lt;number&gt; - Auto Quiz message threshold သတ်မှတ်ရန် (ဒီ chat)\n"
+        "/edquiz - Quiz မေးခွန်း/အဖြေများ ထည့်ရန် (next message)\n"
+        "/edpoint &lt;username_or_id&gt; &lt;score&gt; - Score သတ်မှတ်/ပြင်ရန်\n"
+        "/broadcast - Group အားလုံးထံ message/photo broadcast (next message)\n"
+        "/stats - Users/Groups စာရင်း\n"
+        "/backup - Database backup file ထုတ်ပေးရန်\n"
+        "/restore - Database file ဖြင့် restore (next message = .db document)\n"
+        "/allclear - Data အားလုံးဖျက် (confirmation လို)\n"
+        "/delete &lt;type&gt; &lt;amount&gt; - verse|quiz ဖျက်\n"
+        "/edadmin &lt;id&gt; - Admin add/remove toggle\n"
+        "/edvote - Vote topic/options သတ်မှတ် (next message)\n"
+    )
+    await update.effective_message.reply_text(text)
 
-    app.add_handler(ConversationHandler(
-        entry_points=[CommandHandler("restore", restore_start)],
-        states={RESTORE: [MessageHandler(filters.Document.ALL, restore_receive)]},
-        fallbacks=[CommandHandler("cancel", cancel)],
-    ))
+@require_admin
+async def cmd_edabout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await track_update(update, context)
+    PENDING[update.effective_user.id] = PendingAction(action="edabout", chat_id=update.effective_chat.id)
+    await update.effective_message.reply_text(
+        "<b>✍️ About Edit Mode</b>\n\n"
+        "About text ကို next message အနေနဲ့ ပို့ပေးပါ။ (HTML allowed)"
+    )
 
-    app.add_handler(ConversationHandler(
-        entry_points=[CommandHandler("edvote", edvote_start)],
-        states={EDVOTE: [MessageHandler(filters.TEXT & ~filters.COMMAND, edvote_save)]},
-        fallbacks=[CommandHandler("cancel", cancel)],
-    ))
+@require_admin
+async def cmd_edcontact(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await track_update(update, context)
+    PENDING[update.effective_user.id] = PendingAction(action="edcontact", chat_id=update.effective_chat.id)
+    await update.effective_message.reply_text(
+        "<b>✍️ Contact Edit Mode</b>\n\n"
+        "Next message မှာ line တစ်ကြောင်းစီ ဒီပုံစံနဲ့ပို့ပါ:\n"
+        "<code>Name - Phone</code>\n\n"
+        "ဥပမာ:\n"
+        "<code>Leader A - 09xxxxxxxxx\nLeader B - 09yyyyyyyyy</code>"
+    )
 
-    # Auto quiz message counter (must be near end)
-    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, on_any_message))
+@require_admin
+async def cmd_edverse(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await track_update(update, context)
+    PENDING[update.effective_user.id] = PendingAction(action="edverse", chat_id=update.effective_chat.id)
+    await update.effective_message.reply_text(
+        "<b>✍️ Verse Add Mode</b>\n\n"
+        "Next message မှာ line တစ်ကြောင်းစီ ဒီပုံစံနဲ့ပို့ပါ:\n"
+        "<code>morning: Verse text</code>\n"
+        "<code>night: Verse text</code>\n\n"
+        "တစ်ကြောင်းချင်းအများကြီးပို့လို့ရပါတယ်။"
+    )
 
-    return app
+@require_admin
+async def cmd_edevents(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await track_update(update, context)
+    PENDING[update.effective_user.id] = PendingAction(action="edevents", chat_id=update.effective_chat.id)
+    await update.effective_message.reply_text(
+        "<b>✍️ Events Edit Mode</b>\n\n"
+        "Next message မှာ line တစ်ကြောင်းစီ ဒီပုံစံနဲ့ပို့ပါ:\n"
+        "<code>YYYY-MM-DD - Event text</code>\n\n"
+        "Date မထည့်ချင်ရင် <code>-</code> မပါဘဲ text လည်းရေးနိုင်ပါတယ်။"
+    )
 
+@require_admin
+async def cmd_edbirthday(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await track_update(update, context)
+    PENDING[update.effective_user.id] = PendingAction(action="edbirthday", chat_id=update.effective_chat.id)
+    await update.effective_message.reply_text(
+        "<b>✍️ Birthday Edit Mode</b>\n\n"
+        "Next message မှာ line တစ်ကြောင်းစီ ဒီပုံစံနဲ့ပို့ပါ:\n"
+        "<code>Name - DD/MM</code>\n"
+        "Note ထည့်ချင်ရင်:\n"
+        "<code>Name - DD/MM - Note</code>\n\n"
+        "ဥပမာ:\n"
+        "<code>Mg Mg - 05/02\nSu Su - 12/02 - Youth Member</code>"
+    )
 
-def main():
-    app = build_app()
-    log.info("Bot started...")
+@require_admin
+async def cmd_set(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await track_update(update, context)
+
+    chat = update.effective_chat
+    if not chat:
+        return
+
+    if not context.args or not context.args[0].isdigit():
+        await update.effective_message.reply_text("အသုံးပြုနည်း: <code>/set 50</code> (message 50 ပြည့်တိုင်း Auto Quiz)")
+        return
+
+    n = int(context.args[0])
+    db.set_threshold(chat.id, n)
+    await update.effective_message.reply_text(
+        f"✅ ဒီ chat အတွက် Auto Quiz threshold ကို <b>{n}</b> သတ်မှတ်ပြီးပါပြီ။\n"
+        "0 ထားလိုက်ရင် Auto Quiz ပိတ်ပါမယ်။"
+    )
+
+@require_admin
+async def cmd_edquiz(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await track_update(update, context)
+    PENDING[update.effective_user.id] = PendingAction(action="edquiz", chat_id=update.effective_chat.id)
+    await update.effective_message.reply_text(
+        "<b>✍️ Quiz Add Mode</b>\n\n"
+        "Next message မှာ Quiz အများကြီးကို block အလိုက်ထည့်နိုင်ပါတယ်။\n\n"
+        "Format (block တစ်ခု = Quiz တစ်ခု):\n"
+        "<code>Q: Question text\n"
+        "A) option1\n"
+        "B) option2\n"
+        "C) option3\n"
+        "D) option4\n"
+        "ANS: B\n"
+        "EXP: optional explanation</code>\n\n"
+        "Quiz တစ်ခုနဲ့တစ်ခုကြားမှာ blank line ထားပေးပါ။"
+    )
+
+@require_admin
+async def cmd_edpoint(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await track_update(update, context)
+    chat = update.effective_chat
+    if not chat:
+        return
+
+    if len(context.args) < 2:
+        await update.effective_message.reply_text("အသုံးပြုနည်း: <code>/edpoint username_or_id score</code>")
+        return
+
+    target = context.args[0].strip()
+    score_raw = context.args[1].strip()
+    if not score_raw.lstrip("-").isdigit():
+        await update.effective_message.reply_text("Score က number ဖြစ်ရပါမယ်။")
+        return
+
+    score = int(score_raw)
+    # try resolve by id
+    user_id: Optional[int] = int(target) if target.isdigit() else None
+    username = None
+    full_name = "Unknown"
+
+    if user_id is None:
+        # resolve from tracked users in this chat by username
+        rows = db.users_in_chat(chat.id)
+        for r in rows:
+            u = (r["username"] or "").strip()
+            if u and u.lower() == target.lstrip("@").lower():
+                user_id = int(r["user_id"])
+                username = u
+                full_name = (r["full_name"] or "").strip() or "Unknown"
+                break
+
+    if user_id is None:
+        await update.effective_message.reply_text("User ကို မတွေ့ပါ။ (ဒီ group ထဲမှာ tracked ဖြစ်ဖို့လိုပါတယ်)")
+        return
+
+    db.set_points(chat.id, user_id, username, full_name, score)
+    await update.effective_message.reply_text(f"✅ Score သတ်မှတ်ပြီးပါပြီ: <b>{score}</b>")
+
+@require_admin
+async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await track_update(update, context)
+    PENDING[update.effective_user.id] = PendingAction(action="broadcast", chat_id=update.effective_chat.id)
+    await update.effective_message.reply_text(
+        "<b>📢 Broadcast Mode</b>\n\n"
+        "Group အားလုံးထံပို့မယ့် message (စာ/ပုံ) ကို next message အဖြစ် ပို့ပေးပါ။\n"
+        "Bot က groups အားလုံးကို copy_message နဲ့ပို့ပါမယ်။"
+    )
+
+@require_admin
+async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await track_update(update, context)
+    await send_typing(update, context)
+
+    chats = db.conn.execute("SELECT chat_id, title, type FROM chats ORDER BY added_at DESC").fetchall()
+    users = db.conn.execute("SELECT COUNT(DISTINCT user_id) AS c FROM users").fetchone()
+    user_count = int(users["c"]) if users else 0
+
+    lines = [
+        "<b>📊 Stats</b>",
+        f"• Total tracked users: <b>{user_count}</b>",
+        f"• Total chats/groups: <b>{len(chats)}</b>",
+        "",
+        "<b>Chats</b>"
+    ]
+    for r in chats[:30]:
+        title = (r["title"] or "").strip()
+        ctype = (r["type"] or "").strip()
+        lines.append(f"• <code>{int(r['chat_id'])}</code> — {html.escape(title)} (<code>{html.escape(ctype)}</code>)")
+    await update.effective_message.reply_text("\n".join(lines))
+
+@require_admin
+async def cmd_backup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await track_update(update, context)
+    await send_typing(update, context)
+
+    # copy db
+    backup_name = f"backup_{dt.datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.db"
+    tmp_path = os.path.join(os.getcwd(), backup_name)
+    try:
+        db.conn.commit()
+        shutil.copyfile(DB_FILE, tmp_path)
+        await update.effective_message.reply_document(document=open(tmp_path, "rb"), filename=backup_name, caption="✅ Backup DB")
+    finally:
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
+
+@require_admin
+async def cmd_restore(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await track_update(update, context)
+    PENDING[update.effective_user.id] = PendingAction(action="restore", chat_id=update.effective_chat.id)
+    await update.effective_message.reply_text(
+        "<b>♻️ Restore Mode</b>\n\n"
+        "Restore လုပ်မယ့် <code>.db</code> file ကို next message အဖြစ် Document နဲ့ပို့ပါ။\n"
+        "သတိ: Existing data ကို အစားထိုးပါမယ်။"
+    )
+
+@require_admin
+async def cmd_allclear(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await track_update(update, context)
+    PENDING[update.effective_user.id] = PendingAction(action="allclear_confirm", chat_id=update.effective_chat.id)
+    await update.effective_message.reply_text(
+        "<b>⚠️ ALL CLEAR</b>\n\n"
+        "Data အားလုံးကို ဖျက်မယ်ဆိုရင် next message မှာ အတိအကျ <code>CONFIRM</code> လို့ပို့ပါ။"
+    )
+
+@require_admin
+async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await track_update(update, context)
+    if len(context.args) < 2:
+        await update.effective_message.reply_text("အသုံးပြုနည်း: <code>/delete verse 10</code> သို့ <code>/delete quiz 5</code>")
+        return
+
+    dtype = context.args[0].strip().lower()
+    amount_raw = context.args[1].strip()
+    if not amount_raw.isdigit():
+        await update.effective_message.reply_text("amount က number ဖြစ်ရပါမယ်။")
+        return
+
+    amount = int(amount_raw)
+    if amount <= 0:
+        await update.effective_message.reply_text("amount > 0 ဖြစ်ရပါမယ်။")
+        return
+
+    if dtype == "verse":
+        n = db.delete_verses(amount)
+        await update.effective_message.reply_text(f"✅ Verse ဖျက်ပြီးပါပြီ: {n}")
+        return
+    if dtype == "quiz":
+        n = db.delete_quiz(amount)
+        await update.effective_message.reply_text(f"✅ Quiz ဖျက်ပြီးပါပြီ: {n}")
+        return
+
+    await update.effective_message.reply_text("type မှာ <code>verse</code> သို့ <code>quiz</code> သာလက်ခံပါတယ်။")
+
+@require_admin
+async def cmd_edadmin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await track_update(update, context)
+    if not context.args or not context.args[0].isdigit():
+        await update.effective_message.reply_text("အသုံးပြုနည်း: <code>/edadmin 123456789</code>")
+        return
+
+    uid = int(context.args[0])
+    enabled = db.toggle_admin(uid)
+    state = "ENABLED ✅" if enabled else "DISABLED ⛔"
+    await update.effective_message.reply_text(f"Admin {uid} => {state}")
+
+@require_admin
+async def cmd_edvote(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await track_update(update, context)
+    PENDING[update.effective_user.id] = PendingAction(action="edvote", chat_id=update.effective_chat.id)
+    await update.effective_message.reply_text(
+        "<b>✍️ Vote Setup Mode</b>\n\n"
+        "Next message format:\n"
+        "<code>Topic: ....\n"
+        "1) Name One\n"
+        "2) Name Two\n"
+        "3) Name Three\n"
+        "4) Optional\n"
+        "5) Optional</code>\n\n"
+        "Options 3-5 ခု လက်ခံပါတယ်။"
+    )
+
+# ---------------------------
+# Pending handler
+# ---------------------------
+async def handle_pending(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    user = update.effective_user
+    chat = update.effective_chat
+    msg = update.effective_message
+    if not user or not chat or not msg:
+        return False
+
+    pending = PENDING.get(user.id)
+    if not pending:
+        return False
+
+    # Admin guard for pending actions
+    if not db.is_admin(user.id):
+        PENDING.pop(user.id, None)
+        return False
+
+    action = pending.action
+
+    if action == "edabout":
+        text = msg.text or ""
+        text = text.strip()
+        if not text:
+            await msg.reply_text("About text မပါဘူး။ ပြန်ပို့ပါ။")
+            return True
+        db.set_about(text)
+        PENDING.pop(user.id, None)
+        await msg.reply_text("✅ About ကို update လုပ်ပြီးပါပြီ။")
+        return True
+
+    if action == "edcontact":
+        raw = msg.text or ""
+        items = parse_key_value_lines(raw)
+        if not items:
+            await msg.reply_text("Format မမှန်ပါ။ <code>Name - Phone</code> နဲ့ပြန်ပို့ပါ။")
+            return True
+        db.replace_contacts(items)
+        PENDING.pop(user.id, None)
+        await msg.reply_text(f"✅ Contacts update လုပ်ပြီးပါပြီ။ (count={len(items)})")
+        return True
+
+    if action == "edverse":
+        raw = msg.text or ""
+        verses: List[Tuple[str, str]] = []
+        for line in raw.splitlines():
+            s = line.strip()
+            if not s:
+                continue
+            if ":" not in s:
+                continue
+            k, v = s.split(":", 1)
+            verses.append((k.strip().lower(), v.strip()))
+        if not verses:
+            await msg.reply_text("Format မမှန်ပါ။ <code>morning: ...</code> / <code>night: ...</code> နဲ့ပြန်ပို့ပါ။")
+            return True
+        added = db.add_verses(verses)
+        PENDING.pop(user.id, None)
+        await msg.reply_text(f"✅ Verse ထည့်ပြီးပါပြီ။ (added={added})")
+        return True
+
+    if action == "edevents":
+        raw = msg.text or ""
+        items: List[Tuple[Optional[str], str]] = []
+        for line in raw.splitlines():
+            s = line.strip()
+            if not s:
+                continue
+            if "-" in s and len(s.split("-", 1)[0].strip()) == 10:
+                left, right = s.split("-", 1)
+                d = left.strip()
+                text = right.strip()
+                # basic date check
+                try:
+                    dt.date.fromisoformat(d)
+                    items.append((d, text))
+                except Exception:
+                    items.append((None, s))
+            else:
+                items.append((None, s))
+        if not items:
+            await msg.reply_text("Events မပါဘူး။ ပြန်ပို့ပါ။")
+            return True
+        db.replace_events(items)
+        PENDING.pop(user.id, None)
+        await msg.reply_text(f"✅ Events update လုပ်ပြီးပါပြီ။ (count={len(items)})")
+        return True
+
+    if action == "edbirthday":
+        raw = msg.text or ""
+        items: List[Tuple[str, int, int, Optional[str]]] = []
+        for line in raw.splitlines():
+            s = line.strip()
+            if not s:
+                continue
+            parts = [p.strip() for p in s.split("-")]
+            if len(parts) < 2:
+                continue
+            name = parts[0]
+            dm = parts[1]
+            note = parts[2] if len(parts) >= 3 else ""
+            if "/" not in dm:
+                continue
+            d_str, m_str = [x.strip() for x in dm.split("/", 1)]
+            if not (d_str.isdigit() and m_str.isdigit()):
+                continue
+            day = int(d_str)
+            month = int(m_str)
+            if day < 1 or day > 31 or month < 1 or month > 12:
+                continue
+            if name:
+                items.append((name, day, month, note))
+        if not items:
+            await msg.reply_text("Format မမှန်ပါ။ <code>Name - DD/MM</code> နဲ့ပြန်ပို့ပါ။")
+            return True
+        db.replace_birthdays(items)
+        PENDING.pop(user.id, None)
+        await msg.reply_text(f"✅ Birthday list update လုပ်ပြီးပါပြီ။ (count={len(items)})")
+        return True
+
+    if action == "edquiz":
+        raw = msg.text or ""
+        blocks = [b.strip() for b in raw.split("\n\n") if b.strip()]
+        items: List[Tuple[str, List[str], int, Optional[str]]] = []
+
+        def parse_block(b: str) -> Optional[Tuple[str, List[str], int, Optional[str]]]:
+            q = ""
+            opts = {"a": "", "b": "", "c": "", "d": ""}
+            ans_letter = ""
+            exp = ""
+            for line in b.splitlines():
+                s = line.strip()
+                if not s:
+                    continue
+                low = s.lower()
+                if low.startswith("q:"):
+                    q = s[2:].strip()
+                elif low.startswith("a)"):
+                    opts["a"] = s[2:].strip()
+                elif low.startswith("b)"):
+                    opts["b"] = s[2:].strip()
+                elif low.startswith("c)"):
+                    opts["c"] = s[2:].strip()
+                elif low.startswith("d)"):
+                    opts["d"] = s[2:].strip()
+                elif low.startswith("ans:"):
+                    ans_letter = s[4:].strip().lower()
+                elif low.startswith("exp:"):
+                    exp = s[4:].strip()
+            if not q:
+                return None
+            opt_list = [opts["a"], opts["b"], opts["c"], opts["d"]]
+            if any(not x for x in opt_list):
+                return None
+            letter_map = {"a": 0, "b": 1, "c": 2, "d": 3}
+            if ans_letter not in letter_map:
+                return None
+            return (q, opt_list, letter_map[ans_letter], exp or "")
+
+        for b in blocks:
+            parsed = parse_block(b)
+            if parsed:
+                items.append(parsed)
+
+        if not items:
+            await msg.reply_text("Quiz format မမှန်ပါ။ /edquiz command မှာ ပြထားတဲ့ format နဲ့ပြန်ပို့ပါ။")
+            return True
+
+        added = db.add_quiz_bulk(items)
+        PENDING.pop(user.id, None)
+        await msg.reply_text(f"✅ Quiz ထည့်ပြီးပါပြီ။ (added={added})")
+        return True
+
+    if action == "broadcast":
+        # Copy current message to all chats (except private users not started? we track all chats)
+        chat_ids = db.chat_ids()
+        sent = 0
+        failed = 0
+        for cid in chat_ids:
+            try:
+                # avoid copying to the same admin private? it's okay; user requested groups, but we track all chats
+                await context.bot.copy_message(
+                    chat_id=cid,
+                    from_chat_id=chat.id,
+                    message_id=msg.message_id,
+                )
+                sent += 1
+            except Exception:
+                failed += 1
+        PENDING.pop(user.id, None)
+        await msg.reply_text(f"✅ Broadcast done. sent={sent}, failed={failed}")
+        return True
+
+    if action == "restore":
+        doc = msg.document
+        if not doc:
+            await msg.reply_text("Restore အတွက် <code>.db</code> document file ပို့ပေးရပါမယ်။")
+            return True
+        filename = (doc.file_name or "").lower()
+        if not filename.endswith(".db"):
+            await msg.reply_text(".db file ပဲလက်ခံပါတယ်။")
+            return True
+        try:
+            f = await doc.get_file()
+            tmp = os.path.join(os.getcwd(), "restore_tmp.db")
+            await f.download_to_drive(custom_path=tmp)
+
+            # swap db file
+            db.close()
+            shutil.copyfile(tmp, DB_FILE)
+
+            # reopen
+            global db
+            db = DB(DB_FILE)
+
+            PENDING.pop(user.id, None)
+            await msg.reply_text("✅ Restore အောင်မြင်ပါတယ်။ Bot data ပြန်လည်အသုံးပြုနိုင်ပါပြီ။")
+        except Exception as e:
+            logger.exception("restore failed: %s", e)
+            await msg.reply_text("❌ Restore မအောင်မြင်ပါ။ file ကိုစစ်ပြီး ပြန်ကြိုးစားပါ။")
+        finally:
+            try:
+                os.remove(os.path.join(os.getcwd(), "restore_tmp.db"))
+            except Exception:
+                pass
+        return True
+
+    if action == "allclear_confirm":
+        t = (msg.text or "").strip()
+        if t != "CONFIRM":
+            PENDING.pop(user.id, None)
+            await msg.reply_text("Cancelled ✅ (CONFIRM မရေးသဖြင့် ဖျက်ခြင်းမလုပ်ပါ)")
+            return True
+
+        # wipe tables except admins bootstrap + about default
+        try:
+            for table in [
+                "contacts", "verses", "events", "birthdays", "prayers", "quiz",
+                "quiz_answers", "scores", "quiz_settings", "reports",
+                "votes", "vote_votes", "users", "chats", "settings"
+            ]:
+                db._exec(f"DELETE FROM {table}")
+            # keep admins as-is (or you can wipe too)
+            db._exec("UPDATE about SET text=? WHERE id=1", (
+                "အသင်းတော်/လူငယ်အဖွဲ့ အကြောင်းကို Admin က /edabout နဲ့ ထည့်သွင်းနိုင်ပါတယ်။",
+            ))
+            PENDING.pop(user.id, None)
+            await msg.reply_text("✅ All data cleared.")
+        except Exception as e:
+            logger.exception("allclear failed: %s", e)
+            await msg.reply_text("❌ Allclear failed.")
+        return True
+
+    if action == "edvote":
+        raw = msg.text or ""
+        lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+        topic = ""
+        options: List[str] = []
+        for ln in lines:
+            low = ln.lower()
+            if low.startswith("topic:"):
+                topic = ln.split(":", 1)[1].strip()
+                continue
+            if ln[:2].isdigit() and ")" in ln:
+                # 1) Name
+                try:
+                    right = ln.split(")", 1)[1].strip()
+                    if right:
+                        options.append(right)
+                except Exception:
+                    pass
+
+        if not topic or not (3 <= len(options) <= 5):
+            await msg.reply_text("Vote format မမှန်ပါ။ Topic + Options (3-5) ထည့်ပေးပါ။")
+            return True
+
+        vote_id = db.set_vote(pending.chat_id, topic, options)
+        PENDING.pop(user.id, None)
+        await msg.reply_text(f"✅ Vote သတ်မှတ်ပြီးပါပြီ။ (vote_id={vote_id})\nUser များ /vote နဲ့ မဲပေးနိုင်ပါပြီ။")
+        return True
+
+    return False
+
+# ---------------------------
+# Callback Queries
+# ---------------------------
+async def cb_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not query or not query.data:
+        return
+
+    await query.answer()
+    data = query.data
+
+    if data == "noop":
+        return
+
+    # quiz:quiz_id:choice
+    if data.startswith("quiz:"):
+        try:
+            _, qid_s, choice_s = data.split(":")
+            quiz_id = int(qid_s)
+            choice = int(choice_s)
+        except Exception:
+            return
+
+        chat = update.effective_chat
+        user = update.effective_user
+        if not chat or not user:
+            return
+
+        if db.has_answered_quiz(quiz_id, chat.id, user.id):
+            await query.answer("Already answered ✅", show_alert=True)
+            return
+
+        row = db.conn.execute(
+            "SELECT question, options_json, answer_index, explanation FROM quiz WHERE id=?",
+            (quiz_id,)
+        ).fetchone()
+        if not row:
+            await query.answer("Quiz not found", show_alert=True)
+            return
+
+        ans = int(row["answer_index"])
+        options = json.loads(row["options_json"])
+        correct = 1 if choice == ans else 0
+
+        db.record_quiz_answer(quiz_id, chat.id, user.id, choice, correct)
+
+        full_name = safe_full_name(user.first_name, user.last_name)
+        if correct:
+            db.add_points(chat.id, user.id, user.username, full_name, delta=1)
+        else:
+            # wrong: 0 point, or -1 if you want; keep 0 by default
+            pass
+
+        exp = (row["explanation"] or "").strip()
+        chosen_text = options[choice] if 0 <= choice < 4 else "?"
+        correct_text = options[ans] if 0 <= ans < 4 else "?"
+
+        result_msg = (
+            "<b>🧠 Quiz Result</b>\n\n"
+            f"<b>User:</b> {mention_html(user.id, full_name)}\n"
+            f"<b>Your Answer:</b> {html.escape(chosen_text)}\n"
+            f"<b>Correct:</b> {html.escape(correct_text)}\n"
+        )
+        result_msg += "\n<b>✅ Correct!</b>" if correct else "\n<b>❌ Wrong!</b>"
+        if exp:
+            result_msg += "\n\n<b>Explanation:</b>\n" + html.escape(exp)
+
+        try:
+            await query.message.reply_text(result_msg)
+        except Exception:
+            pass
+        return
+
+    # vote:vote_id:option
+    if data.startswith("vote:"):
+        try:
+            _, vid_s, opt_s = data.split(":")
+            vote_id = int(vid_s)
+            opt = int(opt_s)
+        except Exception:
+            return
+        chat = update.effective_chat
+        user = update.effective_user
+        if not chat or not user:
+            return
+
+        row = db.conn.execute(
+            "SELECT topic, options_json FROM votes WHERE id=? AND chat_id=? AND is_active=1",
+            (vote_id, chat.id)
+        ).fetchone()
+        if not row:
+            await query.answer("Vote not active", show_alert=True)
+            return
+
+        options = json.loads(row["options_json"])
+        if opt < 0 or opt >= len(options):
+            return
+
+        db.cast_vote(vote_id, chat.id, user.id, opt)
+        await query.answer("Voted ✅", show_alert=True)
+        return
+
+    # vote results
+    if data.startswith("vote_res:"):
+        try:
+            _, vid_s = data.split(":")
+            vote_id = int(vid_s)
+        except Exception:
+            return
+        chat = update.effective_chat
+        if not chat:
+            return
+
+        row = db.conn.execute("SELECT topic, options_json FROM votes WHERE id=? AND chat_id=?", (vote_id, chat.id)).fetchone()
+        if not row:
+            await query.answer("Vote not found", show_alert=True)
+            return
+
+        topic = str(row["topic"])
+        options = json.loads(row["options_json"])
+        res = db.vote_results(vote_id, chat.id)
+        counts = {int(r["option_index"]): int(r["c"]) for r in res}
+        total = sum(counts.values())
+
+        lines = [f"<b>📊 Vote Results</b>\n<b>Topic:</b> {html.escape(topic)}\n"]
+        for i, opt in enumerate(options):
+            c = counts.get(i, 0)
+            pct = (c / total * 100.0) if total > 0 else 0.0
+            lines.append(f"• {html.escape(opt)} — <b>{c}</b> ({pct:.1f}%)")
+        lines.append(f"\n<b>Total Votes:</b> <b>{total}</b>")
+
+        await query.message.reply_text("\n".join(lines))
+        return
+
+# ---------------------------
+# Auto Quiz trigger on messages
+# ---------------------------
+async def on_any_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await track_update(update, context)
+
+    # 1) handle pending admin input first
+    if await handle_pending(update, context):
+        return
+
+    # 2) auto quiz logic only in groups
+    if not is_group_chat(update):
+        return
+
+    chat = update.effective_chat
+    user = update.effective_user
+    if not chat or not user:
+        return
+    if user.is_bot:
+        return
+
+    threshold, msg_count = db.inc_msg_count(chat.id)
+    if threshold > 0 and msg_count >= threshold:
+        db.reset_msg_count(chat.id)
+        try:
+            await send_quiz_to_chat(chat.id, context)
+        except Exception as e:
+            logger.exception("auto quiz send failed: %s", e)
+
+# ---------------------------
+# Error handler
+# ---------------------------
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.exception("Unhandled error: %s", context.error)
+
+# ---------------------------
+# Main
+# ---------------------------
+def main() -> None:
+    defaults = Defaults(parse_mode=ParseMode.HTML)
+
+    app = Application.builder().token(BOT_TOKEN).defaults(defaults).build()
+
+    # user
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("helps", cmd_helps))
+    app.add_handler(CommandHandler("about", cmd_about))
+    app.add_handler(CommandHandler("contact", cmd_contact))
+    app.add_handler(CommandHandler("verse", cmd_verse))
+    app.add_handler(CommandHandler("events", cmd_events))
+    app.add_handler(CommandHandler("birthday", cmd_birthday))
+    app.add_handler(CommandHandler("pray", cmd_pray))
+    app.add_handler(CommandHandler("praylist", cmd_praylist))
+    app.add_handler(CommandHandler("quiz", cmd_quiz))
+    app.add_handler(CommandHandler("tops", cmd_tops))
+    app.add_handler(CommandHandler("report", cmd_report))
+    app.add_handler(CommandHandler("all", cmd_all))
+    app.add_handler(CommandHandler("vote", cmd_vote))
+
+    # admin
+    app.add_handler(CommandHandler("edit", cmd_edit))
+    app.add_handler(CommandHandler("edabout", cmd_edabout))
+    app.add_handler(CommandHandler("edcontact", cmd_edcontact))
+    app.add_handler(CommandHandler("edverse", cmd_edverse))
+    app.add_handler(CommandHandler("edevents", cmd_edevents))
+    app.add_handler(CommandHandler("edbirthday", cmd_edbirthday))
+    app.add_handler(CommandHandler("set", cmd_set))
+    app.add_handler(CommandHandler("edquiz", cmd_edquiz))
+    app.add_handler(CommandHandler("edpoint", cmd_edpoint))
+    app.add_handler(CommandHandler("broadcast", cmd_broadcast))
+    app.add_handler(CommandHandler("stats", cmd_stats))
+    app.add_handler(CommandHandler("backup", cmd_backup))
+    app.add_handler(CommandHandler("restore", cmd_restore))
+    app.add_handler(CommandHandler("allclear", cmd_allclear))
+    app.add_handler(CommandHandler("delete", cmd_delete))
+    app.add_handler(CommandHandler("edadmin", cmd_edadmin))
+    app.add_handler(CommandHandler("edvote", cmd_edvote))
+
+    # callbacks
+    app.add_handler(CallbackQueryHandler(cb_handler))
+
+    # any text handler (pending + auto quiz)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_any_text))
+    # also allow pending actions to accept captions for photo? (broadcast commonly)
+    app.add_handler(MessageHandler(filters.PHOTO | filters.Document.ALL, on_any_text))
+
+    app.add_error_handler(on_error)
+
+    logger.info("Bot started.")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
-
 
 if __name__ == "__main__":
     main()
