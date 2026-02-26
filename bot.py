@@ -7,6 +7,7 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime, date
 from zoneinfo import ZoneInfo
+from typing import Optional
 
 from dotenv import load_dotenv
 from telegram import (
@@ -270,7 +271,7 @@ class DB:
             """, (chat_id, title, chat_type, ts))
             con.commit()
 
-    def upsert_chat_user(self, chat_id: int, user_id: int, username: str | None, first_name: str | None, last_name: str | None):
+def upsert_chat(self, chat_id: int, title: Optional[str], chat_type: str):
         ts = now_tz().isoformat()
         with self.conn() as con:
             con.execute("""
